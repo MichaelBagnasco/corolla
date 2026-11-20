@@ -166,6 +166,67 @@ struct Item {
     target: crate::cleanup::Target,
     bytes: u64,
 }
+enum Drag {
+    Entry {
+        id: usize,
+        rejection: Option<String>,
+    },
+    Virtual(&'static str),
+}
+impl Drag {
+    fn entry(&self) -> Option<usize> {
+        match self {
+            Self::Entry { id, .. } => Some(*id),
+            Self::Virtual(_) => None,
+        }
+    }
+    fn rejection(&self) -> Option<&str> {
+        match self {
+            Self::Entry { rejection, .. } => rejection.as_deref(),
+            Self::Virtual(reason) => Some(reason),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragEnd {
+    Held,
+    Released(Pos2),
+    Canceled,
+}
+
+fn drag_end(input: &egui::InputState) -> DragEnd {
+    use egui::{Event, PointerButton};
+    if !input.focused
+        || input.key_pressed(Key::Escape)
+        || input
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::WindowFocused(false)))
+    {
+        return DragEnd::Canceled;
+    }
+    // Use the actual primary release event, never a remembered pointer position.
+    // A touchscreen normally emits PointerGone immediately after the release.
+    for event in &input.events {
+        match event {
+            Event::PointerGone => return DragEnd::Canceled,
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                ..
+            } => return DragEnd::Released(*pos),
+            _ => {}
+        }
+    }
+    if input.pointer.primary_down() {
+        DragEnd::Held
+    } else {
+        DragEnd::Canceled
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Dialog {
     Help,
@@ -193,7 +254,8 @@ pub struct App {
     selected: Option<usize>,
     map_hover: Option<usize>,
     list_hover: Option<usize>,
-    drag: Option<usize>,
+    drag: Option<Drag>,
+    drop_notice: Option<(Instant, String)>,
     collected: Vec<Item>,
     trash_job: Option<Receiver<CleanupOutcome>>,
     picker: Option<Receiver<Option<PathBuf>>>,
@@ -241,6 +303,7 @@ impl App {
             map_hover: None,
             list_hover: None,
             drag: None,
+            drop_notice: None,
             collected: vec![],
             trash_job: None,
             picker: None,
@@ -283,7 +346,7 @@ impl App {
         if self.trash_job.is_some() {
             return;
         }
-        self.drag = None;
+        self.clear_hover();
         self.dialog = None;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -417,6 +480,8 @@ impl App {
         self.map_hover = None;
         self.list_hover = None;
         self.drag = None;
+        self.drop_notice = None;
+        self.chart.set_dragged(None);
     }
     fn open(&mut self, id: usize) {
         let Some(scan) = &self.scan else {
@@ -460,37 +525,54 @@ impl App {
             self.clear_hover();
         }
     }
-    fn collect(&mut self, id: usize) {
-        let Some(scan) = &self.scan else {
-            return;
-        };
-        let path = scan.path(id);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        if id == self.view_root
-            || home.as_deref().is_some_and(|h| h.starts_with(&path))
-            || self.volumes.iter().any(|v| v.path.starts_with(&path))
-        {
-            self.fail("This location is protected. Collect individual items inside it.");
-            return;
+    fn candidate(&self, id: usize) -> Result<Item, String> {
+        let scan = self.scan.as_ref().ok_or("The map is no longer open.")?;
+        let node = scan
+            .nodes
+            .get(id)
+            .ok_or("This item is no longer in the map.")?;
+        if id == self.view_root {
+            return Err("Choose an item inside the scanned folder.".into());
         }
+        let path = scan.path(id);
         if self
             .collected
             .iter()
-            .any(|item| path.starts_with(&item.target.path))
+            .any(|i| path.starts_with(&i.target.path))
         {
-            return;
+            return Err("This item is already in the collector.".into());
         }
-        match crate::cleanup::Target::from_scan(&path, scan.nodes[id].identity) {
-            Ok(target) => {
-                self.collected
-                    .retain(|item| !item.target.path.starts_with(&path));
-                self.collected.push(Item {
-                    target,
-                    bytes: scan.nodes[id].bytes,
-                });
-            }
-            Err(message) => self.fail(message),
+        let target = crate::cleanup::Target::from_scan(&path, node.identity)?;
+        Ok(Item {
+            target,
+            bytes: node.bytes,
+        })
+    }
+
+    fn stage(&mut self, id: usize) -> Result<(), String> {
+        let item = self.candidate(id)?;
+        self.collected
+            .retain(|old| !old.target.path.starts_with(&item.target.path));
+        self.collected.push(item);
+        Ok(())
+    }
+
+    fn collect(&mut self, id: usize) {
+        if let Err(reason) = self.stage(id) {
+            self.fail(reason);
         }
+    }
+
+    fn begin_drag(&mut self, ctx: &Context, id: usize) {
+        let rejection = self.candidate(id).err();
+        self.start_drag(ctx, Drag::Entry { id, rejection });
+    }
+
+    fn start_drag(&mut self, ctx: &Context, drag: Drag) {
+        self.chart.set_dragged(drag.entry());
+        self.drop_notice = None;
+        self.drag = Some(drag);
+        ctx.request_repaint();
     }
     fn choose_folder(&mut self, ctx: &Context) {
         if self.picker.is_some() {
@@ -836,10 +918,16 @@ impl App {
                     } else {
                         ("Free space", free.unwrap(), MUTED)
                     };
-                    let (rect, r) = ui.allocate_exact_size(
-                        vec2(ui.available_width(), row_height),
-                        Sense::hover(),
-                    );
+                    let (rect, r) = ui
+                        .allocate_exact_size(vec2(ui.available_width(), row_height), Sense::drag());
+                    if r.drag_started_by(egui::PointerButton::Primary) {
+                        let reason = if name == "Free space" {
+                            "Free space is already available."
+                        } else {
+                            "Unmapped space has no file to collect."
+                        };
+                        self.start_drag(ui.ctx(), Drag::Virtual(reason));
+                    }
                     item_line(ui, rect, name, &size(value), dot, MUTED);
                     if name == "Unmapped space" {
                         r.on_hover_text(concat!(
@@ -873,8 +961,8 @@ impl App {
                 if response.clicked() {
                     self.open(id);
                 }
-                if response.drag_started() {
-                    self.drag = Some(id);
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    self.begin_drag(ui.ctx(), id);
                 }
                 response.context_menu(|ui| {
                     if ui.button("File details").clicked() {
@@ -906,6 +994,8 @@ impl App {
         let mut plot = ui.new_child(UiBuilder::new().max_rect(map));
         let capacity = self.volume_at(&scan, self.focus).map(|v| (v.total, v.free));
         self.chart.view_root = self.view_root;
+        self.chart
+            .set_dragged(self.drag.as_ref().and_then(Drag::entry));
         let out = self.chart.show(
             &mut plot,
             &scan,
@@ -919,12 +1009,13 @@ impl App {
             match event {
                 ChartEvent::Open(id) => self.open(id),
                 ChartEvent::Back => self.up(),
-                ChartEvent::Drag(id) => self.drag = Some(id),
+                ChartEvent::Drag(id) => self.begin_drag(ui.ctx(), id),
+                ChartEvent::BlockedDrag(reason) => self.start_drag(ui.ctx(), Drag::Virtual(reason)),
                 ChartEvent::Collect(id) => self.collect(id),
             }
         }
         let mut sidebar = ui.new_child(UiBuilder::new().max_rect(list));
-        let inspecting = if self.selected.is_some() {
+        let inspecting = if self.selected.is_some() || self.drag.is_some() {
             self.focus
         } else {
             self.map_hover.unwrap_or(self.focus)
@@ -934,6 +1025,7 @@ impl App {
             pos2(rect.left(), rect.bottom() - 54.),
             pos2(split - 10., rect.bottom()),
         );
+        self.update_drag(ui.ctx(), foot);
         self.collector_bar(ui, foot);
         if self.cached_view || scan.skipped > 0 {
             let mut status = Vec::new();
@@ -947,99 +1039,197 @@ impl App {
             let region = Rect::from_min_max(pos2(split, rect.bottom() - 29.), rect.max);
             ellipsis(ui, region, &msg, 12., MUTED, Align::Max);
         }
-        if let Some(id) = self.drag
-            && let Some(pos) = ui.ctx().pointer_interact_pos()
+        if let Some(drag) = &self.drag
+            && let Some(pos) = ui.ctx().pointer_latest_pos()
         {
-            if ui.input(|i| i.pointer.any_released() || !i.pointer.any_down()) {
-                self.drag = None;
-                if foot.contains(pos) {
-                    self.collect(id);
-                }
+            ui.ctx().set_cursor_icon(if drag.rejection().is_some() {
+                egui::CursorIcon::NotAllowed
             } else {
-                let name = scan.nodes[id].name.to_string_lossy();
+                egui::CursorIcon::Grabbing
+            });
+            if let Some(id) = drag.entry() {
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(
                     egui::Order::Tooltip,
-                    Id::new("lifted item"),
+                    Id::new("lifted petal"),
                 ));
-                let galley =
-                    painter.layout_no_wrap(name.into_owned(), FontId::proportional(14.), TEXT);
-                let dims = galley.size().min(vec2(260., 24.)) + vec2(20., 12.);
-                let rect = Rect::from_min_size(pos + vec2(13., 12.), dims);
-                painter.rect_filled(rect, 12., LINE);
-                painter.with_clip_rect(rect.shrink(3.)).galley(
-                    rect.min + vec2(10., 6.),
-                    galley,
-                    TEXT,
-                );
+                self.chart
+                    .paint_drag(&painter, &scan, id, pos + vec2(6., -13.));
             }
-        } else if ui.input(|i| !i.pointer.any_down()) {
-            self.drag = None;
         }
     }
+
+    fn update_drag(&mut self, ctx: &Context, collector: Rect) {
+        if self.drag.is_none() {
+            return;
+        }
+        let outcome = ctx.input(drag_end);
+        if outcome == DragEnd::Held {
+            return;
+        }
+        let drag = self.drag.take().unwrap();
+        if let DragEnd::Released(pos) = outcome
+            && collector.contains(pos)
+            && self.dialog.is_none()
+            && self.trash_job.is_none()
+            && !egui::Popup::is_any_open(ctx)
+            && let Drag::Entry {
+                id,
+                rejection: None,
+            } = drag
+            && let Err(reason) = self.stage(id)
+        {
+            // Files can move or change permissions while the pointer is held.
+            self.drop_notice = Some((Instant::now(), reason));
+        }
+        self.chart.set_dragged(None);
+        ctx.stop_dragging();
+        ctx.request_repaint();
+    }
+
     fn collector_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let r = ui.interact(rect, Id::new("collector bar"), Sense::click());
+        const REJECT: Color32 = Color32::from_rgb(255, 56, 69);
+        let response = ui.interact(rect, Id::new("collector bar"), Sense::click());
         let hot = self.drag.is_some()
             && ui
                 .ctx()
-                .pointer_interact_pos()
+                .pointer_latest_pos()
                 .is_some_and(|p| rect.contains(p));
-        let active = ui
+        let hover = ui
             .ctx()
-            .animate_bool(Id::new("collector glow"), hot || r.hovered());
+            .animate_bool(Id::new("collector glow"), hot || response.hovered());
         let center = rect.left_center() + vec2(25., 0.);
-        let radius = 22. + 2. * active;
+        let radius = 22. + 2. * hover;
         let occupied = !self.collected.is_empty();
-        if occupied || hot {
-            let track =
-                Rect::from_min_max(center - vec2(0., 15.), pos2(rect.right(), center.y + 15.));
-            ui.painter().rect_filled(track, 14., PANEL);
+        if self
+            .drop_notice
+            .as_ref()
+            .is_some_and(|(time, _)| time.elapsed() >= Duration::from_secs(4))
+        {
+            self.drop_notice = None;
         }
-        let edge = if hot {
-            MINT
-        } else if occupied {
-            BLUE
-        } else {
-            LINE
-        };
-        ui.painter().circle_filled(center, radius, BG);
-        ui.painter()
-            .circle_stroke(center, radius, Stroke::new(2_f32, edge));
-        ui.painter()
-            .circle_stroke(center, radius - 6., Stroke::new(2_f32, edge));
-        if occupied {
-            label_at(
-                ui,
-                center,
-                Align2::CENTER_CENTER,
-                &self.collected.len().to_string(),
-                14.,
-                TEXT,
-            );
-        } else {
-            ui.painter().circle_filled(center, radius - 12., edge);
-        }
-        let total = self
-            .collected
-            .iter()
-            .fold(0u64, |s, t| s.saturating_add(t.bytes));
-        let msg = if self.trash_job.is_some() {
-            "Removing items…".to_owned()
+        let denied = self
+            .drag
+            .as_ref()
+            .and_then(Drag::rejection)
+            .or_else(|| self.drop_notice.as_ref().map(|(_, msg)| msg.as_str()));
+        let accepting = self.drag.is_some() && denied.is_none();
+        let reviewing = occupied && self.drag.is_none() && denied.is_none();
+        let mut text = if let Some(reason) = denied {
+            reason.to_owned()
+        } else if self.trash_job.is_some() {
+            "Removing items…".into()
         } else if hot {
             "Release to collect".into()
+        } else if accepting {
+            "Drag here to collect".into()
         } else if occupied {
+            let total = self
+                .collected
+                .iter()
+                .fold(0u64, |bytes, item| bytes.saturating_add(item.bytes));
             format!("{} collected", size(total))
         } else {
             "Drag files here to collect them".into()
         };
-        label_at(
-            ui,
-            center + vec2(37., 0.),
-            Align2::LEFT_CENTER,
-            &msg,
-            15.,
-            if occupied { TEXT } else { MUTED },
-        );
-        if occupied {
+        let text_right = rect.right() - if reviewing { 81. } else { 9. };
+        let text_left = center.x + 37.;
+        let text_color = if occupied || accepting || denied.is_some() {
+            TEXT
+        } else {
+            MUTED
+        };
+        let available = (text_right - text_left).max(1.);
+        let font = FontId::proportional(15.);
+        if let Some(id) = self.drag.as_ref().and_then(Drag::entry)
+            && let Some(node) = self.scan.as_ref().and_then(|scan| scan.nodes.get(id))
+        {
+            let name = node.name.to_string_lossy();
+            if !name.chars().any(char::is_control) {
+                let named = if denied.is_some() {
+                    format!("“{name}”  ·  {text}")
+                } else if hot {
+                    format!("Release to collect “{name}”")
+                } else {
+                    format!("Drag “{name}” here to collect")
+                };
+                if ui
+                    .painter()
+                    .layout_no_wrap(named.clone(), font.clone(), text_color)
+                    .size()
+                    .x
+                    <= available
+                {
+                    text = named;
+                }
+            }
+        }
+        let mut layout = egui::text::LayoutJob::simple(text, font, text_color, available);
+        layout.wrap.max_rows = 2;
+        let galley = ui.painter().layout_job(layout);
+        if occupied || self.drag.is_some() || denied.is_some() {
+            let half = (galley.size().y / 2. + 4.).max(15.).min(rect.height() / 2.);
+            let track =
+                Rect::from_min_max(center - vec2(0., half), pos2(rect.right(), center.y + half));
+            ui.painter().rect_filled(track, 14., PANEL);
+        }
+        ui.painter().circle_filled(center, radius, BG);
+        let edge = if denied.is_some() {
+            LINE
+        } else if accepting && hot {
+            MINT
+        } else if accepting || occupied {
+            BLUE
+        } else {
+            LINE
+        };
+        ui.painter()
+            .circle_stroke(center, radius, Stroke::new(2_f32, edge));
+        if denied.is_some() {
+            let r = radius - 6.;
+            ui.painter()
+                .circle_stroke(center, r, Stroke::new(3.5_f32, REJECT));
+            let diagonal = vec2(r * 0.7, r * 0.7);
+            ui.painter().line_segment(
+                [center - diagonal, center + diagonal],
+                Stroke::new(3.5_f32, REJECT),
+            );
+        } else if accepting {
+            ui.painter()
+                .circle_stroke(center, radius - 6., Stroke::new(2_f32, edge));
+            let glyph = if hot {
+                vec![
+                    center + vec2(-8., 0.),
+                    center + vec2(-2., 6.),
+                    center + vec2(8., -6.),
+                ]
+            } else {
+                ui.painter().line_segment(
+                    [center - vec2(0., 7.), center + vec2(0., 7.)],
+                    Stroke::new(2.5_f32, edge),
+                );
+                vec![center - vec2(7., 0.), center + vec2(7., 0.)]
+            };
+            ui.painter()
+                .add(egui::Shape::line(glyph, Stroke::new(2.5_f32, edge)));
+        } else {
+            ui.painter()
+                .circle_stroke(center, radius - 6., Stroke::new(2_f32, edge));
+            if occupied {
+                label_at(
+                    ui,
+                    center,
+                    Align2::CENTER_CENTER,
+                    &self.collected.len().to_string(),
+                    14.,
+                    TEXT,
+                );
+            } else {
+                ui.painter().circle_filled(center, radius - 12., edge);
+            }
+        }
+        let label_pos = pos2(text_left, center.y - galley.size().y / 2.);
+        ui.painter().galley(label_pos, galley, text_color);
+        if reviewing {
             label_at(
                 ui,
                 pos2(rect.right() - 12., center.y),
@@ -1049,11 +1239,20 @@ impl App {
                 BLUE,
             );
         }
-        if r.clicked() && self.trash_job.is_none() {
+        if self.drag.is_none() && response.clicked() && self.trash_job.is_none() {
             self.dialog = Some(Dialog::Collector);
         }
     }
     fn shortcuts(&mut self, ctx: &Context) {
+        if self.drag.is_some() {
+            if ctx.input(|i| i.key_pressed(Key::Escape) || !i.focused) {
+                self.drag = None;
+                self.chart.set_dragged(None);
+                ctx.stop_dragging();
+                ctx.request_repaint();
+            }
+            return;
+        }
         if self.dialog.is_some()
             || self.trash_job.is_some()
             || self.picker.is_some()
@@ -1676,6 +1875,147 @@ fn drive_icon(ui: &Ui, c: Pos2, folder: bool, accent: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DragHarness {
+        app: App,
+        ctx: Context,
+        time: f64,
+    }
+    impl DragHarness {
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.time += 0.15;
+            self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(960., 640.))),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    self.app.shortcuts(ctx);
+                    egui::CentralPanel::default()
+                        .frame(Frame::NONE)
+                        .show(ctx, |ui| self.app.explorer(ui));
+                },
+            )
+        }
+
+        fn lift(&mut self, from: Pos2) -> egui::FullOutput {
+            self.frame(vec![egui::Event::PointerMoved(from)]);
+            self.frame(vec![button(from, true)]);
+            self.frame(vec![egui::Event::PointerMoved(from + vec2(12., 0.))])
+        }
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn text_position(output: &egui::FullOutput, needle: &str) -> Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                if let egui::Shape::Text(shape) = &clipped.shape
+                    && shape.galley.job.text == needle
+                {
+                    Some(shape.visual_bounding_rect().center())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing visible text: {needle}"))
+    }
+
+    #[test]
+    fn collector_drag_accepts_only_an_explicit_valid_drop() {
+        use egui::Event;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("individual file");
+        std::fs::write(&path, "original").unwrap();
+        let ctx = Context::default();
+        let mut app = App::initialize(&ctx, None);
+        let scan = scan::scan(tmp.path(), &AtomicBool::new(false), |_, _| {}).unwrap();
+        app.volumes.push(Volume {
+            name: "Test disk".into(),
+            path: scan.root.clone(),
+            total: 100_000,
+            free: 33_000,
+            fs_type: "test".into(),
+        });
+        app.scan = Some(Arc::new(scan));
+        app.explorer = true;
+        let mut gui = DragHarness { app, ctx, time: 0. };
+        let output = gui.frame(vec![]);
+        let row = text_position(&output, "individual file");
+        let foot = text_position(&output, "Drag files here to collect them");
+        let free = text_position(&output, "Free space");
+
+        let output = gui.lift(row);
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::Grabbing
+        );
+        text_position(&output, "Drag “individual file” here to collect");
+        let output = gui.frame(vec![Event::PointerMoved(foot)]);
+        text_position(&output, "Release to collect “individual file”");
+        gui.frame(vec![button(foot, false)]);
+        assert_eq!(gui.app.collected.len(), 1);
+
+        let denied = gui.lift(row);
+        assert_eq!(
+            denied.platform_output.cursor_icon,
+            egui::CursorIcon::NotAllowed
+        );
+        text_position(
+            &denied,
+            "“individual file”  ·  This item is already in the collector.",
+        );
+        assert!(denied.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::LineSegment{points,stroke}
+            if stroke.color==Color32::from_rgb(255,56,69) && points[0].x<points[1].x && points[0].y<points[1].y)));
+        gui.frame(vec![Event::PointerMoved(foot), button(foot, false)]);
+        assert_eq!(gui.app.collected.len(), 1);
+        assert!(gui.app.dialog.is_none());
+        gui.app.collected.clear();
+
+        let denied = gui.lift(free);
+        text_position(&denied, "Free space is already available.");
+        assert!(matches!(gui.app.drag, Some(Drag::Virtual(_))));
+        gui.frame(vec![Event::PointerMoved(foot), button(foot, false)]);
+        assert!(gui.app.collected.is_empty());
+
+        for end in [
+            button(row, false),
+            Event::PointerGone,
+            Event::WindowFocused(false),
+            Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ] {
+            gui.lift(row);
+            assert!(gui.app.drag.is_some());
+            gui.frame(vec![Event::PointerMoved(foot), end]);
+            gui.frame(vec![button(foot, false)]);
+            assert!(gui.app.drag.is_none() && gui.app.collected.is_empty() && gui.app.explorer);
+        }
+
+        gui.lift(row);
+        std::fs::rename(&path, tmp.path().join("moved")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        let changed = gui.frame(vec![Event::PointerMoved(foot), button(foot, false)]);
+        let reason = gui.app.drop_notice.as_ref().unwrap().1.as_str();
+        text_position(&changed, reason);
+        assert!(gui.app.collected.is_empty() && gui.app.dialog.is_none());
+    }
 
     fn finish_open(app: &mut App, ctx: &Context) -> Arc<Scan> {
         let deadline = Instant::now() + Duration::from_secs(8);

@@ -22,7 +22,7 @@ Corolla keeps completed scans so you can reopen disks, folders, and their scanne
 
 Gray petals represent files. Colored petals represent folders. Very small neighbors share a dimmed segment that opens a list. On a whole disk, purple shows used space outside the scan and the gap shows free space. The inspector ranks items by allocated size. Sparse files use their allocated blocks, and hard links share one allocation. Btrfs reflinks and snapshots can share physical extents, so removing an item may release less space than its displayed size.
 
-Drag a petal or inspector row to the collector. Open the collector to review or remove items, move them to the desktop Trash, or permanently delete them after confirmation. Empty the desktop Trash to reclaim space from trashed files. Cleanup runs with your normal user permissions.
+Drag a petal or inspector row to the collector. While you hold a folder, its branch follows the pointer and the map closes the gap. A red slash on the collector explains why an item cannot be added. Release outside the collector or press **Esc** to cancel the drag. Open the collector to review or remove items, move them to the desktop Trash, or permanently delete them after confirmation. Empty the desktop Trash to reclaim space from trashed files. Cleanup runs with your normal user permissions.
 
 | Shortcut | Action |
 | --- | --- |

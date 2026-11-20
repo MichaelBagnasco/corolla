@@ -1,8 +1,10 @@
 //! Keep the selection tied to the directory entry that was collected.
 //! Symlinks are entries in their own right and must never be followed.
 use std::{
-    env, fs,
-    os::unix::fs::MetadataExt,
+    env,
+    ffi::CString,
+    fs,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -14,6 +16,93 @@ pub struct Target {
     is_dir: bool,
 }
 
+// Protect the system directories themselves. Ordinary entries inside them are
+// subject to the same parent-directory permissions as files on a data drive.
+fn system_root(path: &Path) -> bool {
+    const ROOTS: &[&str] = &[
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/lost+found",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/swap",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/var",
+        "/usr/local",
+        "/var/tmp",
+    ];
+    ROOTS.iter().any(|root| path == Path::new(root)) || path.parent() == Some(Path::new("/home"))
+}
+
+fn can_remove_from(parent: &Path, entry: &fs::Metadata) -> Result<(), String> {
+    let raw = CString::new(parent.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut fs_info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // statfs initializes the output structure on success.
+    if unsafe { libc::statfs(raw.as_ptr(), fs_info.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let fs_type = unsafe { fs_info.assume_init() }.f_type;
+    if matches!(
+        fs_type,
+        libc::PROC_SUPER_MAGIC
+            | libc::SYSFS_MAGIC
+            | libc::DEVPTS_SUPER_MAGIC
+            | libc::CGROUP_SUPER_MAGIC
+            | libc::CGROUP2_SUPER_MAGIC
+            | libc::DEBUGFS_MAGIC
+            | libc::SECURITYFS_MAGIC
+            | libc::TRACEFS_MAGIC
+            | libc::BPF_FS_MAGIC
+    ) {
+        return Err("Kernel filesystem entries are protected.".into());
+    }
+    let parent_info = fs::metadata(parent).map_err(|e| e.to_string())?;
+    // devtmpfs shares its filesystem magic with tmpfs. Compare device IDs to
+    // distinguish /dev itself from separate mounts such as /dev/shm.
+    if parent.starts_with("/dev")
+        && fs::metadata("/dev").is_ok_and(|dev| dev.dev() == parent_info.dev())
+    {
+        return Err("Device filesystem entries are protected.".into());
+    }
+    // Let Linux evaluate ACLs, effective IDs and read-only mounts. Unlinking needs
+    // write and search permission on the parent, regardless of the file's mode.
+    let access = unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            raw.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if access != 0 {
+        return Err("You do not have permission to remove items from this folder.".into());
+    }
+    let uid = unsafe { libc::geteuid() };
+    if parent_info.mode() & libc::S_ISVTX != 0
+        && uid != 0
+        && parent_info.uid() != uid
+        && entry.uid() != uid
+    {
+        return Err("This shared folder protects items owned by another user.".into());
+    }
+    Ok(())
+}
+
 impl Target {
     pub fn capture(path: &Path) -> Result<Self, String> {
         let home = env::var_os("HOME").map(PathBuf::from);
@@ -22,13 +111,26 @@ impl Target {
         let resolved = fs::canonicalize(parent)
             .map_err(|e| e.to_string())?
             .join(name);
-        if resolved != path || home.as_deref().is_some_and(|h| h.starts_with(path)) {
-            return Err("This folder or its parent is protected or has changed.".into());
+        if resolved != path {
+            return Err("This location changed since the scan.".into());
+        }
+        let canonical_home = home.as_deref().and_then(|h| h.canonicalize().ok());
+        if home
+            .as_deref()
+            .into_iter()
+            .chain(canonical_home.as_deref())
+            .any(|h| h.starts_with(path))
+        {
+            return Err("Your home folder and its parents are protected.".into());
+        }
+        if system_root(path) {
+            return Err("This system location is protected.".into());
         }
         if crate::scan::contains_mount(path).map_err(|e| e.to_string())? {
             return Err("This location contains a mounted filesystem.".into());
         }
         let m = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        can_remove_from(parent, &m)?;
         Ok(Self {
             path: path.into(),
             identity: (m.dev(), m.ino(), m.ctime(), m.ctime_nsec()),
@@ -99,6 +201,64 @@ pub fn remove(targets: &[Target], permanent: bool) -> CleanupReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protects_system_roots_while_allowing_user_owned_working_directories() {
+        for p in [
+            "/usr",
+            "/usr/local",
+            "/etc",
+            "/proc",
+            "/sys",
+            "/boot",
+            "/home/alice",
+            "/var",
+            "/var/tmp",
+        ] {
+            assert!(system_root(Path::new(p)), "{p}");
+        }
+        for p in [
+            "/home/alice/Downloads",
+            "/usr/local/work/tree",
+            "/var/home/alice/Downloads",
+            "/var/lib/my-app/output",
+            "/opt/studio/scratch",
+            "/mnt/disk/etc",
+            "/media/usb/boot",
+            "/run/media/alice/external/photos",
+            "/run/user/1000/gvfs/sftp:host=server/data",
+            "/srv/team/files",
+            "/tmp/usr",
+            "/var/tmp/my-file",
+        ] {
+            assert!(!system_root(Path::new(p)), "{p}");
+        }
+        assert!(Target::capture(Path::new("/")).is_err());
+        assert!(Target::capture(Path::new("/etc")).is_err());
+        assert!(Target::capture(Path::new("/proc/uptime")).is_err());
+        assert!(Target::capture(Path::new("/dev/null")).is_err());
+        if let Some(home) = env::var_os("HOME") {
+            assert!(Target::capture(Path::new(&home)).is_err());
+        }
+    }
+
+    #[test]
+    fn removal_eligibility_uses_directory_permissions_and_keeps_symlinks_as_entries() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("owned data");
+        fs::create_dir(&parent).unwrap();
+        let link = parent.join("system-link");
+        symlink("/usr", &link).unwrap();
+        let before = Target::capture(&link).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let read_only = Target::from_scan(&link, before.identity);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(read_only.is_err());
+        }
+        assert!(Target::from_scan(&link, before.identity).is_ok());
+    }
 
     #[test]
     fn partial_recursive_removal_marks_only_the_attempted_directory_for_recheck() {

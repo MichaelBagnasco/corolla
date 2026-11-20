@@ -1,6 +1,10 @@
 use crate::{app::size as format_size, scan::Scan};
 use egui::{Align2, Color32, CursorIcon, FontId, Mesh, Pos2, Sense, Stroke, Ui, Vec2};
-use std::{collections::HashMap, f32::consts::TAU};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    f32::consts::{FRAC_PI_2, TAU},
+};
 
 const HUB: f32 = 0.17;
 const BANDS: [f32; 9] = [HUB, 0.30, 0.43, 0.56, 0.69, 0.82, 0.915, 0.967, 1.0];
@@ -11,6 +15,7 @@ pub enum ChartEvent {
     Open(usize),
     Back,
     Drag(usize),
+    BlockedDrag(&'static str),
     Collect(usize),
 }
 
@@ -110,6 +115,8 @@ fn petal_color(midpoint: f64, depth: usize) -> Color32 {
 
 struct Layout<'a> {
     scan: &'a Scan,
+    // Only the held node and the ancestors between it and the hub lose bytes.
+    adjusted: HashMap<usize, u64>,
     root_bytes: f64,
     extent: f64,
     start_angle: f64,
@@ -122,20 +129,45 @@ impl Layout<'_> {
         if depth + 1 >= BANDS.len() {
             return;
         }
-        let children = &self.scan.nodes[parent].children;
+        let original = &self.scan.nodes[parent].children;
+        // Just one member of a sibling list can shrink. Move that ancestor
+        // down to its new rank without sorting potentially millions of files.
+        let mut children: Cow<'_, [usize]> = Cow::Borrowed(original);
+        if self.adjusted.contains_key(&parent)
+            && let Some((rank, amount)) = original
+                .iter()
+                .enumerate()
+                .find_map(|(rank, id)| self.adjusted.get(id).copied().map(|bytes| (rank, bytes)))
+            && amount > 0
+        {
+            let shift =
+                original[rank + 1..].partition_point(|&id| self.scan.nodes[id].bytes > amount);
+            if shift > 0 {
+                children.to_mut()[rank..=rank + shift].rotate_left(1);
+            }
+        }
         for (index, &id) in children.iter().enumerate() {
             let node = &self.scan.nodes[id];
-            if node.bytes == 0 {
+            let bytes = self.adjusted.get(&id).copied().unwrap_or(node.bytes);
+            if bytes == 0 {
+                if node.bytes != 0 {
+                    continue;
+                } // This branch is in the pointer's hand.
                 break;
             }
-            let span = node.bytes as f64 / self.root_bytes;
+            let span = bytes as f64 / self.root_bytes;
             let inner = BANDS[depth];
             let outer = BANDS[depth + 1];
             let tiny = span * self.extent * f64::from(outer * self.radius) < 2.3;
             let (petal, span, color) = if tiny {
                 let bytes = children[index..]
                     .iter()
-                    .map(|&i| self.scan.nodes[i].bytes as f64)
+                    .map(|&i| {
+                        self.adjusted
+                            .get(&i)
+                            .copied()
+                            .unwrap_or(self.scan.nodes[i].bytes) as f64
+                    })
                     .sum::<f64>();
                 let span = bytes / self.root_bytes;
                 let color = tint(
@@ -204,7 +236,12 @@ pub struct Chart {
     volume: Option<(u64, u64)>,
     swatches: HashMap<Swatch, Color32>,
     started: f64,
-    press: Option<usize>,
+    press: Option<ChartEvent>,
+    held: Option<usize>,
+    layout_held: Option<usize>,
+    lift_graphic: Option<(usize, Vec<Sector>)>,
+    duration: f64,
+    displayed_bytes: (u64, u64),
     small: Option<(usize, usize)>,
     hover_state: Option<Petal>,
     previous_hover: Option<Petal>,
@@ -212,9 +249,129 @@ pub struct Chart {
 }
 
 impl Chart {
+    pub fn set_dragged(&mut self, id: Option<usize>) {
+        self.held = id;
+    }
+
+    fn dragged_bytes(&self, scan: &Scan, focus: usize) -> HashMap<usize, u64> {
+        let mut adjusted = HashMap::new();
+        let Some(mut id) = self.held.filter(|&i| i != focus && i < scan.nodes.len()) else {
+            return adjusted;
+        };
+        let bytes = scan.nodes[id].bytes;
+        loop {
+            adjusted.insert(id, scan.nodes[id].bytes.saturating_sub(bytes));
+            if id == focus {
+                return adjusted;
+            }
+            let Some(parent) = scan.nodes[id].parent else {
+                return HashMap::new();
+            };
+            id = parent;
+        }
+    }
+
+    // Preserve the branch's visible color and its pattern of outer rings before
+    // the main chart closes the gap. Tiny inspector entries use a local layout.
+    fn capture_graphic(&self, scan: &Scan, id: usize) -> Vec<Sector> {
+        let source = self
+            .motions
+            .iter()
+            .find(|m| m.petal == Petal::Entry(id) && m.to_alpha > 0.0)
+            .map(|m| m.to);
+        let mut sectors = if let Some(base) = source {
+            self.motions
+                .iter()
+                .filter_map(|m| {
+                    let mut child = match m.petal {
+                        Petal::Entry(c) => c,
+                        Petal::Smaller { parent, .. } => parent,
+                        Petal::Unmapped => return None,
+                    };
+                    let s = m.to;
+                    if m.to_alpha == 0.0
+                        || s.inner < base.inner
+                        || s.end < base.start
+                        || s.start > base.end
+                    {
+                        return None;
+                    }
+                    while child != id {
+                        child = scan.nodes[child].parent?;
+                    }
+                    Some(s)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let base = Sector {
+                start: 0.0,
+                end: 1.4,
+                inner: HUB,
+                outer: BANDS[1],
+                color: self.branch_color(scan, id),
+            };
+            let mut layout = Layout {
+                scan,
+                adjusted: HashMap::new(),
+                root_bytes: scan.nodes[id].bytes.max(1) as f64,
+                extent: 1.4,
+                start_angle: 0.0,
+                radius: 65.0,
+                entries: Vec::new(),
+            };
+            layout.children(id, 0.0, 1);
+            let mut sectors = vec![base];
+            for (key, mut s) in layout.entries {
+                if let Petal::Entry(i) = key
+                    && let Some(color) = self.swatches.get(&Swatch::Entry(i))
+                {
+                    s.color = *color;
+                }
+                sectors.push(s);
+            }
+            sectors
+        };
+        if let Some(base) = source.or_else(|| sectors.first().copied()) {
+            let span = (base.end - base.start).max(f32::EPSILON);
+            let sweep = span.clamp(1.2, 2.3);
+            let thickness = sectors.iter().map(|s| s.outer).fold(base.outer, f32::max) - base.inner;
+            for s in &mut sectors {
+                s.start = -FRAC_PI_2 + ((s.start - base.start) / span - 0.5) * sweep;
+                s.end = -FRAC_PI_2 + ((s.end - base.start) / span - 0.5) * sweep;
+                s.inner = 0.18 + 0.82 * (s.inner - base.inner) / thickness;
+                s.outer = 0.18 + 0.82 * (s.outer - base.inner) / thickness;
+            }
+        }
+        sectors
+    }
+
+    /// Paint the detached branch in a 42-point square centered on the drag badge.
+    pub fn paint_drag(&mut self, painter: &egui::Painter, scan: &Scan, id: usize, center: Pos2) {
+        if id >= scan.nodes.len() {
+            return;
+        }
+        if self.lift_graphic.as_ref().map(|(id, _)| *id) != Some(id) {
+            self.lift_graphic = Some((id, self.capture_graphic(scan, id)));
+        }
+        if let Some((_, sectors)) = &self.lift_graphic {
+            let mut mesh = Mesh::default();
+            for &s in sectors {
+                draw_sector(&mut mesh, s, s.color, center + Vec2::new(0.0, 12.0), 22.0);
+            }
+            painter.add(mesh);
+        }
+    }
+
     pub fn branch_color(&self, scan: &Scan, id: usize) -> Color32 {
         if !scan.nodes[id].is_dir {
             return FILE;
+        }
+        if self.held == Some(id)
+            && let Some((lifted, sectors)) = &self.lift_graphic
+            && *lifted == id
+            && let Some(root) = sectors.first()
+        {
+            return root.color;
         }
         self.swatches
             .get(&Swatch::Entry(id))
@@ -237,19 +394,33 @@ impl Chart {
     ) {
         let nav = self.focus != Some(focus);
         let capacity_changed = self.volume != volume;
-        if !nav && !capacity_changed && (radius - self.radius).abs() < 3.0 {
+        let lift_changed = self.held != self.layout_held;
+        if !nav && !capacity_changed && !lift_changed && (radius - self.radius).abs() < 3.0 {
             return;
         }
-        let bytes = scan.nodes[focus].bytes.max(1) as f64;
-        let measured = scan.nodes[focus].bytes;
+        if lift_changed {
+            self.lift_graphic = self
+                .held
+                .filter(|&i| i < scan.nodes.len())
+                .map(|id| (id, self.capture_graphic(scan, id)));
+        }
+        let adjusted = self.dragged_bytes(scan, focus);
+        let original = scan.nodes[focus].bytes;
+        let measured = adjusted.get(&focus).copied().unwrap_or(original);
         let (capacity, free) = volume.unwrap_or((measured, 0));
-        let per_byte = f64::from(TAU) / (capacity as f64).max(bytes);
+        // Holding a petal previews reclaiming its bytes. On a volume it grows
+        // the free gap; inside a folder the remaining children fill the circle.
+        let denominator = volume
+            .map_or(measured, |(total, _)| total.max(original))
+            .max(1);
+        let per_byte = f64::from(TAU) / denominator as f64;
         let extent = per_byte * measured as f64;
-        let unmapped = capacity.saturating_sub(free).saturating_sub(measured);
+        let unmapped = capacity.saturating_sub(free).saturating_sub(original);
         let end_angle = f64::from(TAU) - per_byte * unmapped as f64;
         let mut layout = Layout {
             scan,
-            root_bytes: bytes,
+            adjusted,
+            root_bytes: measured.max(1) as f64,
             extent,
             start_angle: (end_angle - extent).max(0.0),
             radius,
@@ -294,7 +465,11 @@ impl Chart {
         let mut old: HashMap<_, _> = self
             .motions
             .iter()
-            .filter(|m| m.to_alpha > 0.0)
+            .filter(|m| {
+                (lift_changed && !nav)
+                    || m.to_alpha > 0.0
+                    || lerp(m.from_alpha, m.to_alpha, prev_t) > 0.001
+            })
             .map(|m| {
                 (
                     m.petal,
@@ -336,10 +511,17 @@ impl Chart {
                 to_alpha: 1.0,
             });
         }
-        if nav {
+        if nav || lift_changed {
             for (petal, (from, alpha)) in old {
                 let to = if let Some(arc) = outward {
                     from.into_arc(arc)
+                } else if lift_changed && !nav {
+                    let seam = (from.start + from.end) * 0.5;
+                    Sector {
+                        start: seam,
+                        end: seam,
+                        ..from
+                    }
                 } else {
                     Sector {
                         inner: HUB,
@@ -355,13 +537,26 @@ impl Chart {
                     to_alpha: 0.0,
                 });
             }
+        }
+        if nav {
             self.small = None;
             self.hover_state = None;
             self.previous_hover = None;
             self.press = None;
         }
         self.volume = volume;
-        self.started = if nav || capacity_changed {
+        self.layout_held = self.held;
+        let label = volume.map_or(measured, |(total, _)| total);
+        self.displayed_bytes = (
+            if lift_changed {
+                self.label_bytes(prev_t)
+            } else {
+                label
+            },
+            label,
+        );
+        self.duration = if lift_changed && !nav { 0.29 } else { 0.43 };
+        self.started = if nav || capacity_changed || lift_changed {
             now
         } else {
             now - 1.0
@@ -371,8 +566,58 @@ impl Chart {
     }
 
     fn progress(&self, now: f64) -> f32 {
-        let t = ((now - self.started) as f32 / 0.43).clamp(0.0, 1.0);
+        let t = ((now - self.started) / self.duration.max(0.001)).clamp(0.0, 1.0) as f32;
         t * t * (3.0 - 2.0 * t)
+    }
+
+    fn label_bytes(&self, t: f32) -> u64 {
+        let (from, to) = self.displayed_bytes;
+        (from as f64 + (to as f64 - from as f64) * f64::from(t)).round() as u64
+    }
+
+    fn petal_at(&self, p: Vec2, t: f32) -> Option<Petal> {
+        let angle = p.angle().rem_euclid(TAU);
+        let distance = p.length();
+        self.motions.iter().find_map(|m| {
+            let s = m.from.tween(m.to, t);
+            (m.to_alpha > 0.0
+                && angle >= s.start
+                && angle < s.end
+                && distance >= s.inner
+                && distance < s.outer)
+                .then_some(m.petal)
+        })
+    }
+
+    fn drag_source(
+        &self,
+        p: Vec2,
+        t: f32,
+        disk: Option<(u64, u64)>,
+        measured: u64,
+    ) -> Option<ChartEvent> {
+        if p.length() < HUB {
+            return Some(ChartEvent::BlockedDrag(
+                "The center represents the current folder.",
+            ));
+        }
+        match self.petal_at(p, t) {
+            Some(Petal::Entry(id)) => Some(ChartEvent::Drag(id)),
+            Some(Petal::Smaller { .. }) => Some(ChartEvent::BlockedDrag(
+                "Open smaller items to choose a file or folder.",
+            )),
+            Some(Petal::Unmapped) => Some(ChartEvent::BlockedDrag(
+                "Unmapped space has no file to collect.",
+            )),
+            None => {
+                let (total, free) = disk?;
+                let gap = TAU
+                    * (free.min(total.saturating_sub(measured)) as f64 / total.max(1) as f64)
+                        as f32;
+                (p.length() <= 1.0 && p.angle().rem_euclid(TAU) < gap)
+                    .then_some(ChartEvent::BlockedDrag("Free space is already available."))
+            }
+        }
     }
 
     pub fn show(
@@ -400,19 +645,7 @@ impl Chart {
         }
         let pointer = response.hover_pos().map(|pos| (pos - center) / radius);
         let inside_hub = pointer.is_some_and(|p| p.length() < HUB);
-        let hit = pointer.and_then(|pointer| {
-            let angle = pointer.angle().rem_euclid(TAU);
-            let distance = pointer.length();
-            self.motions.iter().find_map(|m| {
-                let s = m.from.tween(m.to, t);
-                (m.to_alpha > 0.0
-                    && angle >= s.start
-                    && angle < s.end
-                    && distance >= s.inner
-                    && distance < s.outer)
-                    .then_some(m.petal)
-            })
-        });
+        let hit = pointer.and_then(|p| self.petal_at(p, t));
         let hovered = match hit {
             Some(Petal::Entry(id)) => Some(id),
             Some(Petal::Smaller { parent, .. }) if parent != focus => Some(parent),
@@ -463,7 +696,7 @@ impl Chart {
             Color32::from_rgb(84, 96, 118)
         };
         painter.circle_stroke(center, hub_radius - 0.5, Stroke::new(0.8_f32, ring_color));
-        let label = format_size(volume.map_or(scan.nodes[focus].bytes, |(total, _)| total));
+        let label = format_size(self.label_bytes(t));
         let (number, unit) = label.rsplit_once(' ').unwrap_or((&label, ""));
         let font_size = (hub_radius * 0.46).clamp(9.0, 27.0);
         let fg = Color32::from_rgb(239, 243, 252);
@@ -482,14 +715,15 @@ impl Chart {
             Color32::from_rgb(190, 201, 219),
         );
 
-        if response.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed()) {
-            self.press = match hit {
-                Some(Petal::Entry(id)) => Some(id),
-                _ => None,
-            };
+        if response.is_pointer_button_down_on()
+            && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+        {
+            self.press = ui.input(|i| i.pointer.press_origin()).and_then(|pos| {
+                self.drag_source((pos - center) / radius, t, volume, scan.nodes[focus].bytes)
+            });
         }
-        if response.drag_started() {
-            output.event = self.press.take().map(ChartEvent::Drag);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            output.event = self.press.take();
         } else if response.clicked() {
             let collect = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             match hit {
@@ -686,6 +920,125 @@ mod tests {
         assert_eq!(chart.progress(2.), 1.);
     }
 
+    fn motion(chart: &Chart, key: Petal) -> Motion {
+        *chart.motions.iter().find(|m| m.petal == key).unwrap()
+    }
+
+    fn near(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.00001, "{a} != {b}");
+    }
+
+    #[test]
+    fn lifting_changes_ancestor_sizes_and_restores_from_the_current_frame() {
+        let mut scan = fixture();
+        let mut extra = scan.nodes[3].clone();
+        extra.name = "second track".into();
+        extra.bytes = 24;
+        scan.nodes[3].bytes = 36;
+        scan.nodes.push(extra);
+        scan.nodes[1].children.push(4);
+        let mut chart = Chart::default();
+        chart.update_layout(&scan, 0, None, 200., 0.);
+        let before = motion(&chart, Petal::Entry(1)).to;
+        chart.set_dragged(Some(3));
+        chart.update_layout(&scan, 0, None, 200., 1.);
+        let changed = motion(&chart, Petal::Entry(1));
+        near(changed.from.start, before.start);
+        near(changed.to.end - changed.to.start, TAU * 24. / 64.);
+        near(changed.to.start, TAU * 40. / 64.);
+        let fading = motion(&chart, Petal::Entry(3));
+        assert_eq!(fading.to_alpha, 0.);
+        assert_eq!(chart.label_bytes(1.), 64);
+
+        let fraction = chart.progress(1.11);
+        assert!(fraction > 0. && fraction < 1.);
+        let midway = fading.from.tween(fading.to, fraction);
+        chart.set_dragged(None);
+        chart.update_layout(&scan, 0, None, 200., 1.11);
+        let restoring = motion(&chart, Petal::Entry(3));
+        near(restoring.from.start, midway.start);
+        near(restoring.from.end, midway.end);
+        near(restoring.from_alpha, 1. - fraction);
+        near(motion(&chart, Petal::Entry(1)).to.start, before.start);
+        near(motion(&chart, Petal::Entry(1)).to.end, before.end);
+        assert_eq!(chart.label_bytes(1.), 100);
+        assert_eq!(scan.nodes[0].bytes, 100);
+    }
+
+    #[test]
+    fn whole_disk_drag_increases_free_gap_and_lifts_matching_branch_colors() {
+        let scan = fixture();
+        let mut chart = Chart::default();
+        let volume = Some((200, 80));
+        chart.update_layout(&scan, 0, volume, 200., 0.);
+        let color = motion(&chart, Petal::Entry(1)).to.color;
+        chart.set_dragged(Some(1));
+        chart.update_layout(&scan, 0, volume, 200., 1.);
+        let remaining = motion(&chart, Petal::Entry(2)).to;
+        near(remaining.start, TAU * 140. / 200.);
+        near(remaining.end - remaining.start, TAU * 40. / 200.);
+        let unmapped = motion(&chart, Petal::Unmapped).to;
+        near(unmapped.end - unmapped.start, TAU * 20. / 200.);
+        let (id, cluster) = chart.lift_graphic.as_ref().unwrap();
+        assert_eq!(*id, 1);
+        assert_eq!(chart.branch_color(&scan, 1), color);
+        assert_eq!(cluster.len(), 2);
+        assert!(cluster.iter().any(|s| s.color == color));
+        assert!(cluster.iter().any(|s| s.color == FILE));
+        assert!(
+            cluster
+                .iter()
+                .all(|s| s.inner >= 0.17 && s.outer <= 1.001 && s.inner < s.outer)
+        );
+        assert_eq!(motion(&chart, Petal::Entry(3)).to_alpha, 0.);
+        chart.set_dragged(None);
+        chart.update_layout(&scan, 0, volume, 200., 2.);
+        near(
+            motion(&chart, Petal::Entry(1)).from.start,
+            motion(&chart, Petal::Entry(1)).from.end,
+        );
+        near(motion(&chart, Petal::Entry(1)).to.start, TAU * 0.4);
+        assert_eq!(chart.label_bytes(1.), 200);
+    }
+
+    #[test]
+    fn free_hidden_center_and_aggregate_report_virtual_sources() {
+        let mut scan = fixture();
+        let mut tiny = scan.nodes[2].clone();
+        tiny.bytes = 1;
+        scan.nodes.push(tiny);
+        scan.nodes[0].children.push(4);
+        scan.nodes[0].bytes += 1;
+        let disk = Some((200, 80));
+        let mut chart = Chart::default();
+        chart.update_layout(&scan, 0, disk, 100., 0.);
+        let hit = |p| chart.drag_source(p, 1., disk, 101);
+        assert!(matches!(hit(Vec2::ZERO), Some(ChartEvent::BlockedDrag(_))));
+        assert!(matches!(
+            hit(Vec2::angled(0.4) * 0.4),
+            Some(ChartEvent::BlockedDrag("Free space is already available."))
+        ));
+        let at = |s: Sector| Vec2::angled((s.start + s.end) * 0.5) * ((s.outer + s.inner) * 0.5);
+        assert!(matches!(
+            hit(at(motion(&chart, Petal::Unmapped).to)),
+            Some(ChartEvent::BlockedDrag(
+                "Unmapped space has no file to collect."
+            ))
+        ));
+        assert!(matches!(
+            hit(at(motion(
+                &chart,
+                Petal::Smaller {
+                    parent: 0,
+                    start: 2
+                }
+            )
+            .to)),
+            Some(ChartEvent::BlockedDrag(_))
+        ));
+        assert!(hit(Vec2::new(1.5, 0.)).is_none());
+    }
+
     #[test]
     fn map_hover_drill_back_and_drag_start() {
         let ctx = Context::default();
@@ -735,6 +1088,12 @@ mod tests {
         assert!(matches!(
             frame(0, 2.1, vec![Event::PointerMoved(pos2(240., 220.))]).event,
             Some(ChartEvent::Drag(1))
+        ));
+        frame(0, 2.2, vec![button(pos2(240., 220.), false)]);
+        frame(0, 2.3, vec![Event::PointerMoved(hub), button(hub, true)]);
+        assert!(matches!(
+            frame(0, 2.4, vec![Event::PointerMoved(pos2(20., 20.))]).event,
+            Some(ChartEvent::BlockedDrag(_))
         ));
     }
 }
