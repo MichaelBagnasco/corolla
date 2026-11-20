@@ -1,9 +1,11 @@
 mod app;
+mod cache;
 mod chart;
 mod cleanup;
 mod favorites;
 mod preview;
 mod scan;
+mod snapshots;
 mod theme;
 
 use std::{

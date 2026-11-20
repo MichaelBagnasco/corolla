@@ -15,6 +15,9 @@ pub struct Node {
     pub name: OsString,
     pub bytes: u64,
     pub is_dir: bool,
+    /// The directory itself or an immediate entry could not be read.
+    pub incomplete: bool,
+    pub identity: (u64, u64, i64, i64),
     pub children: Vec<usize>,
     pub parent: Option<usize>,
 }
@@ -233,6 +236,19 @@ fn boundaries(root: &Path, table: &[Mount]) -> io::Result<Boundaries> {
     })
 }
 
+/// Check nested mount boundaries before inflating a potentially large ancestor snapshot.
+pub fn can_cover(root: &Path, requested: &Path) -> bool {
+    root == requested
+        || (requested.starts_with(root)
+            && mounts()
+                .and_then(|table| boundaries(root, &table))
+                .is_ok_and(|bounds| {
+                    !requested
+                        .ancestors()
+                        .any(|path| bounds.excluded.contains(path))
+                }))
+}
+
 fn node(
     name: OsString,
     metadata: &Metadata,
@@ -246,6 +262,13 @@ fn node(
         name,
         parent,
         is_dir,
+        incomplete: false,
+        identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ),
         bytes: if counted_elsewhere {
             0
         } else {
@@ -356,6 +379,7 @@ pub fn scan(
         let entry = match frame.entries.next() {
             Some(Ok(entry)) => entry,
             Some(Err(_)) => {
+                nodes[parent].incomplete = true;
                 skipped += 1;
                 continue;
             }
@@ -397,13 +421,19 @@ pub fn scan(
                                 stack.push(frame);
                                 continue;
                             }
-                            Err(_) => skipped += 1,
+                            Err(_) => {
+                                nodes[child].incomplete = true;
+                                skipped += 1;
+                            }
                         }
                     }
                     nodes[parent].bytes = nodes[parent].bytes.saturating_add(nodes[child].bytes);
                 }
                 Ok(_) => {}
-                Err(_) => skipped += 1,
+                Err(_) => {
+                    nodes[parent].incomplete = true;
+                    skipped += 1;
+                }
             }
         }
         current.pop();

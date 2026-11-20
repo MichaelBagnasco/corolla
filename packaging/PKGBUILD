@@ -1,5 +1,5 @@
 pkgname=corolla
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Interactive radial disk explorer for Omarchy'
 arch=('x86_64' 'aarch64')

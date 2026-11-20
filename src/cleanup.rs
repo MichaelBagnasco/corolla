@@ -34,6 +34,14 @@ impl Target {
         })
     }
 
+    pub fn from_scan(path: &Path, scanned: (u64, u64, i64, i64)) -> Result<Self, String> {
+        let current = Self::capture(path)?;
+        if current.identity != scanned {
+            return Err("This item changed since the scan. Rescan before collecting it.".into());
+        }
+        Ok(current)
+    }
+
     fn verify(&self) -> Result<(), String> {
         if Self::capture(&self.path)?.identity != self.identity {
             return Err("This item changed after collection. Remove it and scan again.".into());
@@ -99,6 +107,7 @@ mod tests {
         let old = Target::capture(&file).unwrap();
         fs::rename(&file, dir.join("moved")).unwrap();
         fs::write(&file, "replacement").unwrap();
+        assert!(Target::from_scan(&file, old.identity).is_err());
         assert_eq!(delete_permanently(&[old]).len(), 1);
         assert_eq!(fs::read(&file).unwrap(), b"replacement");
         let link = dir.join("link");

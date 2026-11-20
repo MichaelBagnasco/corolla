@@ -196,6 +196,8 @@ enum Swatch {
 
 #[derive(Default)]
 pub struct Chart {
+    // A directory reopened from an ancestor snapshot can be a nonzero node.
+    pub view_root: usize,
     focus: Option<usize>,
     radius: f32,
     motions: Vec<Motion>,
@@ -386,7 +388,11 @@ impl Chart {
         let center = rect.center();
         let radius = (size.x.min(size.y) * 0.475).max(1.0);
         let now = ui.input(|i| i.time);
-        let volume = if focus == 0 { volume } else { None };
+        let volume = if focus == self.view_root {
+            volume
+        } else {
+            None
+        };
         self.update_layout(scan, focus, volume, radius, now);
         let t = self.progress(now);
         if t < 1.0 {
@@ -417,7 +423,7 @@ impl Chart {
             event: None,
         };
         if matches!(hit, Some(Petal::Entry(_) | Petal::Smaller { .. }))
-            || (inside_hub && focus != 0)
+            || (inside_hub && focus != self.view_root)
         {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
@@ -451,7 +457,7 @@ impl Chart {
         let painter = ui.painter_at(rect);
         painter.add(mesh);
         let hub_radius = HUB * radius;
-        let ring_color = if inside_hub && focus != 0 {
+        let ring_color = if inside_hub && focus != self.view_root {
             Color32::from_gray(173)
         } else {
             Color32::from_rgb(84, 96, 118)
@@ -495,11 +501,13 @@ impl Chart {
                     })
                 }
                 Some(Petal::Smaller { parent, start }) => self.small = Some((parent, start)),
-                None if inside_hub && focus != 0 => output.event = Some(ChartEvent::Back),
+                None if inside_hub && focus != self.view_root => {
+                    output.event = Some(ChartEvent::Back)
+                }
                 _ => {}
             }
         }
-        if !response.dragged() && (hit.is_some() || (inside_hub && focus != 0)) {
+        if !response.dragged() && (hit.is_some() || (inside_hub && focus != self.view_root)) {
             response.on_hover_ui_at_pointer(|ui| match hit {
                 Some(Petal::Unmapped) => {
                     let (total, free) = volume.unwrap_or_default();
@@ -519,7 +527,7 @@ impl Chart {
                         scan.nodes[parent].children.len() - start
                     ));
                 }
-                None if inside_hub && focus != 0 => {
+                None if inside_hub && focus != self.view_root => {
                     ui.label("Go to parent");
                 }
                 _ => {}
@@ -626,6 +634,8 @@ mod tests {
             name: name.into(),
             bytes,
             is_dir: !children.is_empty(),
+            identity: (0, 0, 0, 0),
+            incomplete: false,
             parent,
             children,
         };

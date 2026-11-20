@@ -16,6 +16,8 @@ To build and install for your user, run `bin/install` with a stable Rust toolcha
 
 For a pacman-managed installation, `bin/package` creates an Arch package in `packaging/`. Install that file with `sudo pacman -U`. Use `cargo test --release --locked` to run the tests.
 
+Corolla keeps completed scans so you can reopen disks, folders, and their scanned subfolders, even after quitting. The map shows the last scan. Press **R** or click **Rescan** to pick up changes made elsewhere. Recent maps are saved privately in `$XDG_CACHE_HOME/corolla/scans` (normally `~/.cache/corolla/scans`). The disk cache holds up to 12 maps within 512 MiB. Very large maps that exceed the snapshot limits remain available in memory during the session. The command-line JSON report always scans the filesystem.
+
 ## Explore and clean up
 
 Gray petals represent files. Colored petals represent folders. Very small neighbors share a dimmed segment that opens a list. On a whole disk, purple shows used space outside the scan and the gap shows free space. The inspector ranks items by allocated size. Sparse files use their allocated blocks, and hard links share one allocation. Btrfs reflinks and snapshots can share physical extents, so removing an item may release less space than its displayed size.

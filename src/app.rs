@@ -1,12 +1,15 @@
+use crate::cache::ScanCache;
 use crate::chart::{Chart, ChartEvent};
 use crate::scan::{self, Scan, Volume};
+use crate::snapshots;
 use egui::{
     self, Align, Align2, Button, Color32, Context, FontId, Frame, Id, Key, Layout, Modal, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
@@ -39,12 +42,110 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+struct Opened {
+    scan: Arc<Scan>,
+    focus: usize,
+    cached: bool,
+    save_epoch: Option<u64>,
+}
+#[derive(Clone, Copy)]
+enum Phase {
+    Opening,
+    Scanning,
+}
 enum Update {
     Progress(u64, PathBuf),
-    Done(std::io::Result<Scan>),
+    Done(std::io::Result<Opened>),
+}
+
+#[derive(Default)]
+struct Memory {
+    scans: ScanCache,
+    generation: Option<u64>,
+}
+impl Memory {
+    fn synchronize(&mut self, generation: Option<u64>) {
+        if self.generation != generation {
+            self.scans = ScanCache::default();
+            self.generation = generation;
+        }
+    }
+
+    fn invalidate(&mut self, path: &Path) {
+        if let Some((before, after)) = snapshots::invalidate(path) {
+            self.synchronize(Some(before));
+            self.generation = Some(after);
+        }
+        self.scans.invalidate(path);
+    }
+}
+
+// Cache validation, filesystem traversal, and serialization all run on the worker.
+fn open_scan(
+    root: &Path,
+    fresh: bool,
+    cancel: &AtomicBool,
+    memory: &Mutex<Memory>,
+    notify: impl Fn(Update),
+) -> std::io::Result<Opened> {
+    // Explicit invalidation also covers a location which disappeared since scanning.
+    let canonical = root.canonicalize();
+    if fresh {
+        memory
+            .lock()
+            .unwrap()
+            .invalidate(canonical.as_deref().unwrap_or(root));
+    }
+    let root = canonical?;
+    let (generation, remembered) = {
+        let mut memory = memory.lock().unwrap();
+        let generation = snapshots::generation();
+        memory.synchronize(generation);
+        let hit = if fresh { None } else { memory.scans.get(&root) };
+        (generation, hit)
+    };
+    let opened = if let Some((scan, focus)) = remembered {
+        return Ok(Opened {
+            scan,
+            focus,
+            cached: true,
+            save_epoch: None,
+        });
+    } else if let Some((scan, focus)) = (!fresh).then(|| snapshots::load(&root)).flatten() {
+        Opened {
+            scan,
+            focus,
+            cached: true,
+            save_epoch: None,
+        }
+    } else {
+        let scan = Arc::new(scan::scan(&root, cancel, |n, p| {
+            notify(Update::Progress(n, p.into()))
+        })?);
+        Opened {
+            scan,
+            focus: 0,
+            cached: false,
+            save_epoch: generation,
+        }
+    };
+    // An invalidation in another worker can finish while this snapshot is being read.
+    let mut memory = memory.lock().unwrap();
+    if !cancel.load(Ordering::Relaxed)
+        && generation == snapshots::generation()
+        && memory.generation == generation
+    {
+        memory.scans.insert(opened.scan.clone());
+    }
+    Ok(opened)
+}
+struct Overview {
+    volumes: Vec<Volume>,
+    reusable: HashSet<PathBuf>,
 }
 struct Job {
     events: Receiver<Update>,
+    phase: Phase,
     cancel: Arc<AtomicBool>,
     at: PathBuf,
     count: u64,
@@ -73,7 +174,12 @@ enum Dialog {
 pub struct App {
     volumes: Vec<Volume>,
     pinned: Vec<PathBuf>,
-    mounts: Option<Receiver<std::io::Result<Vec<Volume>>>>,
+    mounts: Option<Receiver<std::io::Result<Overview>>>,
+    memory: Arc<Mutex<Memory>>,
+    reusable: HashSet<PathBuf>,
+    writers: Vec<std::thread::JoinHandle<()>>,
+    view_root: usize,
+    cached_view: bool,
     scan: Option<Arc<Scan>>,
     job: Option<Job>,
     explorer: bool,
@@ -98,7 +204,9 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        let ctx = &cc.egui_ctx;
+        Self::initialize(&cc.egui_ctx, initial)
+    }
+    fn initialize(ctx: &Context, initial: Option<PathBuf>) -> Self {
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.override_text_color = Some(TEXT);
@@ -116,6 +224,11 @@ impl App {
             volumes: vec![],
             pinned: crate::favorites::load(),
             mounts: None,
+            memory: Arc::default(),
+            reusable: HashSet::new(),
+            writers: Vec::new(),
+            view_root: 0,
+            cached_view: false,
             scan: None,
             job: None,
             explorer: false,
@@ -150,12 +263,42 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         self.mounts = Some(rx);
+        let pinned = self.pinned.clone();
+        let memory = self.memory.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(scan::volumes());
+            let result = scan::volumes().map(|volumes| {
+                let roots = snapshots::roots();
+                let mut candidates = pinned;
+                candidates.extend(std::env::var_os("HOME").map(PathBuf::from));
+                candidates.extend(volumes.iter().map(|v| v.path.clone()));
+                memory.lock().unwrap().synchronize(snapshots::generation());
+                let reusable = candidates
+                    .into_iter()
+                    .filter(|path| {
+                        let Ok(canonical) = path.canonicalize() else {
+                            return false;
+                        };
+                        memory.lock().unwrap().scans.contains(&canonical)
+                            || roots.iter().any(|r| scan::can_cover(r, &canonical))
+                    })
+                    .collect();
+                Overview { volumes, reusable }
+            });
+            let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
     fn start(&mut self, ctx: &Context, root: PathBuf) {
+        self.launch(ctx, root, false);
+    }
+
+    fn rescan(&mut self, ctx: &Context) {
+        if let Some(scan) = self.scan.take() {
+            self.launch(ctx, scan.path(self.view_root), true);
+        }
+    }
+
+    fn launch(&mut self, ctx: &Context, root: PathBuf, fresh: bool) {
         if self.trash_job.is_some() {
             return;
         }
@@ -165,6 +308,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.job = Some(Job {
+            phase: Phase::Opening,
             at: root.clone(),
             count: 0,
             cancel: cancel.clone(),
@@ -172,9 +316,10 @@ impl App {
             started: Instant::now(),
         });
         let ctx = ctx.clone();
+        let memory = self.memory.clone();
         std::thread::spawn(move || {
-            let result = scan::scan(&root, &cancel, |n, p| {
-                let _ = tx.send(Update::Progress(n, p.into()));
+            let result = open_scan(&root, fresh, &cancel, &memory, |update| {
+                let _ = tx.send(update);
                 ctx.request_repaint();
             });
             let _ = tx.send(Update::Done(result));
@@ -189,7 +334,10 @@ impl App {
         if let Some(result) = self.mounts.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.mounts = None;
             match result {
-                Ok(v) => self.volumes = v,
+                Ok(overview) => {
+                    self.volumes = overview.volumes;
+                    self.reusable = overview.reusable;
+                }
                 Err(e) => self.fail(format!("Could not list disks. {e}")),
             }
         }
@@ -204,6 +352,7 @@ impl App {
             for msg in job.events.try_iter() {
                 match msg {
                     Update::Progress(n, path) => {
+                        job.phase = Phase::Scanning;
                         job.count = n;
                         job.at = path;
                     }
@@ -213,9 +362,19 @@ impl App {
             if let Some(result) = result {
                 self.job = None;
                 match result {
-                    Ok(scan) => {
-                        self.scan = Some(Arc::new(scan));
-                        self.focus = 0;
+                    Ok(opened) => {
+                        if let Some(epoch) = opened.save_epoch {
+                            let new_scan = opened.scan.clone();
+                            self.writers.retain(|writer| !writer.is_finished());
+                            self.writers.push(std::thread::spawn(move || {
+                                snapshots::save_if_current(&new_scan, Some(epoch));
+                            }));
+                        }
+                        self.scan = Some(opened.scan);
+                        self.view_root = opened.focus;
+                        self.focus = opened.focus;
+                        self.cached_view = opened.cached;
+                        self.preview = Default::default();
                         self.explorer = true;
                         self.history.clear();
                         self.forward.clear();
@@ -229,10 +388,18 @@ impl App {
         }
         if let Some(failed) = self.trash_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.trash_job = None;
+            let affected = self.scan.as_ref().is_some_and(|scan| {
+                let view = scan.path(self.view_root);
+                self.collected.iter().any(|item| {
+                    view.starts_with(&item.target.path) || item.target.path.starts_with(&view)
+                })
+            });
             self.collected
                 .retain(|entry| failed.iter().any(|(p, _)| *p == entry.target.path));
-            if let Some(scan) = &self.scan {
-                self.start(ctx, scan.root.clone());
+            if affected {
+                self.rescan(ctx);
+            } else {
+                self.refresh(ctx);
             }
             if !failed.is_empty() {
                 self.fail(
@@ -284,7 +451,9 @@ impl App {
         }
     }
     fn up(&mut self) {
-        if let Some(id) = self.scan.as_ref().and_then(|s| s.nodes[self.focus].parent) {
+        if self.focus != self.view_root
+            && let Some(id) = self.scan.as_ref().and_then(|s| s.nodes[self.focus].parent)
+        {
             self.open(id);
         } else {
             self.explorer = false;
@@ -297,7 +466,7 @@ impl App {
         };
         let path = scan.path(id);
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        if id == 0
+        if id == self.view_root
             || home.as_deref().is_some_and(|h| h.starts_with(&path))
             || self.volumes.iter().any(|v| v.path.starts_with(&path))
         {
@@ -311,7 +480,7 @@ impl App {
         {
             return;
         }
-        match crate::cleanup::Target::capture(&path) {
+        match crate::cleanup::Target::from_scan(&path, scan.nodes[id].identity) {
             Ok(target) => {
                 self.collected
                     .retain(|item| !item.target.path.starts_with(&path));
@@ -382,8 +551,15 @@ impl App {
                     ui.label("Finding disks…");
                 }
                 for volume in &self.volumes {
-                    if volume_row(ui, &volume.name, &volume.path, Some(volume), self.accent)
-                        .clicked()
+                    if volume_row(
+                        ui,
+                        &volume.name,
+                        &volume.path,
+                        Some(volume),
+                        self.accent,
+                        self.reusable.contains(&volume.path),
+                    )
+                    .clicked()
                     {
                         target = Some(volume.path.clone());
                     }
@@ -392,7 +568,16 @@ impl App {
                     && !self.volumes.iter().any(|volume| volume.path == home)
                 {
                     ui.add_space(12.);
-                    if volume_row(ui, "Home folder", &home, None, self.accent).clicked() {
+                    if volume_row(
+                        ui,
+                        "Home folder",
+                        &home,
+                        None,
+                        self.accent,
+                        self.reusable.contains(&home),
+                    )
+                    .clicked()
+                    {
                         target = Some(home);
                     }
                 }
@@ -401,7 +586,14 @@ impl App {
                         .file_name()
                         .unwrap_or(path.as_os_str())
                         .to_string_lossy();
-                    let row = volume_row(ui, &name, path, None, self.accent);
+                    let row = volume_row(
+                        ui,
+                        &name,
+                        path,
+                        None,
+                        self.accent,
+                        self.reusable.contains(path),
+                    );
                     let rect = Rect::from_center_size(
                         row.rect.left_center() + vec2(32., 0.),
                         vec2(41., 41.),
@@ -473,7 +665,10 @@ impl App {
             ui,
             center + vec2(0., 96.),
             Align2::CENTER_CENTER,
-            "Scanning",
+            match job.phase {
+                Phase::Opening => "Opening map",
+                Phase::Scanning => "Scanning",
+            },
             26.,
             TEXT,
         );
@@ -481,7 +676,10 @@ impl App {
             ui,
             center + vec2(0., 127.),
             Align2::CENTER_CENTER,
-            &format!("{} entries  ·  {}s", job.count, time as u64),
+            &match job.phase {
+                Phase::Opening => String::new(),
+                _ => format!("{} entries  ·  {}s", job.count, time as u64),
+            },
             15.,
             MUTED,
         );
@@ -507,7 +705,9 @@ impl App {
     }
     fn toolbar(&mut self, ui: &mut Ui, scan: &Scan) {
         let mut ancestors = vec![self.focus];
-        while let Some(parent) = scan.nodes[*ancestors.last().unwrap()].parent {
+        while *ancestors.last().unwrap() != self.view_root
+            && let Some(parent) = scan.nodes[*ancestors.last().unwrap()].parent
+        {
             ancestors.push(parent);
         }
         ancestors.reverse();
@@ -561,7 +761,7 @@ impl App {
                     .on_hover_text("Rescan this location  ·  R")
                     .clicked()
                 {
-                    self.start(ui.ctx(), scan.root.clone());
+                    self.rescan(ui.ctx());
                 }
                 let folder = scan.path(self.focus);
                 if !self.built_in(&folder) {
@@ -727,6 +927,7 @@ impl App {
         } else {
             None
         };
+        self.chart.view_root = self.view_root;
         let out = self.chart.show(
             &mut plot,
             &scan,
@@ -756,8 +957,15 @@ impl App {
             pos2(split - 10., rect.bottom()),
         );
         self.collector_bar(ui, foot);
-        if scan.skipped > 0 {
-            let msg = format!("{} unreadable entries", scan.skipped);
+        if self.cached_view || scan.skipped > 0 {
+            let mut status = Vec::new();
+            if self.cached_view {
+                status.push("Cached scan".to_string());
+            }
+            if scan.skipped > 0 {
+                status.push(format!("{} unreadable entries", scan.skipped));
+            }
+            let msg = status.join("  ·  ");
             let region = Rect::from_min_max(pos2(split, rect.bottom() - 29.), rect.max);
             ellipsis(ui, region, &msg, 12., MUTED, Align::Max);
         }
@@ -963,7 +1171,7 @@ impl App {
             return;
         }
         if key(Key::R) {
-            self.start(ctx, scan.root.clone());
+            self.rescan(ctx);
             return;
         }
         if (key(Key::Enter) || key(Key::ArrowRight))
@@ -1163,6 +1371,7 @@ impl App {
                     .collect::<Vec<_>>();
                 let (tx, rx) = mpsc::channel();
                 self.trash_job = Some(rx);
+                let memory = self.memory.clone();
                 self.dialog = None;
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
@@ -1171,6 +1380,11 @@ impl App {
                     } else {
                         crate::cleanup::trash(&targets)
                     };
+                    // Even a failed recursive deletion can have removed some descendants.
+                    let mut memory = memory.lock().unwrap();
+                    for target in &targets {
+                        memory.invalidate(&target.path);
+                    }
                     let _ = tx.send(failed);
                     ctx.request_repaint();
                 });
@@ -1204,7 +1418,10 @@ impl App {
                     self.fail(format!("Could not open the file manager. {e}"));
                 }
             }
-            if ui.add_enabled(id != 0, Button::new("Collect")).clicked() {
+            if ui
+                .add_enabled(id != self.view_root, Button::new("Collect"))
+                .clicked()
+            {
                 self.dialog = None;
                 self.collect(id);
             }
@@ -1249,6 +1466,16 @@ impl App {
             });
         if result.should_close() && self.dialog == Some(dialog) {
             self.dialog = None;
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.job.take();
+        // A completed scan is visible immediately. Finish publishing it on normal exit.
+        for writer in self.writers.drain(..) {
+            let _ = writer.join();
         }
     }
 }
@@ -1382,6 +1609,7 @@ fn volume_row(
     path: &Path,
     volume: Option<&Volume>,
     accent: Color32,
+    reusable: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 73.), Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1449,7 +1677,7 @@ fn volume_row(
         ui,
         button.center(),
         Align2::CENTER_CENTER,
-        "Scan",
+        if reusable { "Open" } else { "Scan" },
         14.,
         TEXT,
     );
@@ -1484,5 +1712,83 @@ fn drive_icon(ui: &Ui, c: Pos2, folder: bool, accent: Color32) {
             Stroke::new(1.5_f32, BG),
         );
         p.circle_filled(c + vec2(10., 12.), 1.8, accent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finish_open(app: &mut App, ctx: &Context) -> Arc<Scan> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while app.job.is_some() && Instant::now() < deadline {
+            app.poll(ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.job.is_none() && app.explorer, "{}", app.error);
+        app.scan.as_ref().unwrap().clone()
+    }
+
+    #[test]
+    fn reopens_subtrees_refreshes_explicitly_and_restores_on_restart() {
+        const ISOLATED: &str = "COROLLA_TEST_CACHE_DIRECTORY";
+        let Some(dir) = std::env::var_os(ISOLATED).map(PathBuf::from) else {
+            // Isolate the GUI's actual XDG storage without mutating process-wide
+            // environment variables while the other tests are running.
+            let temp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::reopens_subtrees_refreshes_explicitly_and_restores_on_restart",
+                ])
+                .env(ISOLATED, temp.path())
+                .env("XDG_CACHE_HOME", temp.path().join("cache"))
+                .env("XDG_STATE_HOME", temp.path().join("state"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        };
+        let a = dir.join("A");
+        let child = a.join("child");
+        let b = dir.join("B");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let ctx = Context::default();
+        let mut app = App::initialize(&ctx, Some(a.clone()));
+        let first = finish_open(&mut app, &ctx);
+        app.start(&ctx, b.clone());
+        let other = finish_open(&mut app, &ctx);
+        std::fs::write(child.join("new file"), "new data").unwrap();
+
+        let (picker, rx) = mpsc::channel();
+        app.picker = Some(rx);
+        picker.send(Some(child.clone())).unwrap();
+        app.poll(&ctx);
+        let opened = finish_open(&mut app, &ctx);
+        assert!(app.cached_view && Arc::ptr_eq(&opened, &first));
+        assert_eq!(opened.path(app.view_root), child);
+        assert!(opened.nodes[app.focus].children.is_empty());
+        app.up();
+        assert!(!app.explorer);
+        app.rescan(&ctx);
+        let updated = finish_open(&mut app, &ctx);
+        assert!(!app.cached_view);
+        assert_eq!(updated.root, child);
+        assert_eq!(updated.nodes[app.focus].children.len(), 1);
+
+        app.start(&ctx, b.clone());
+        assert!(Arc::ptr_eq(&finish_open(&mut app, &ctx), &other));
+        drop(app);
+
+        let mut reopened = App::initialize(&ctx, Some(child));
+        assert_eq!(finish_open(&mut reopened, &ctx).nodes[0].children.len(), 1);
+        assert!(reopened.cached_view);
+        reopened.start(&ctx, b);
+        finish_open(&mut reopened, &ctx);
+        assert!(reopened.cached_view);
+        reopened.start(&ctx, a);
+        finish_open(&mut reopened, &ctx);
+        assert!(!reopened.cached_view);
     }
 }
