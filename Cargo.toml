@@ -3,6 +3,8 @@ name = "corolla"
 version = "0.1.1"
 edition = "2024"
 description = "An interactive radial disk explorer for Omarchy"
+license = "MIT"
+repository = "https://github.com/MichaelBagnasco/corolla"
 
 [dependencies]
 eframe = { version = "=0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

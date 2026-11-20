@@ -2,6 +2,7 @@ pkgname=corolla
 pkgver=0.1.1
 pkgrel=1
 pkgdesc='Interactive radial disk explorer for Omarchy'
+license=('MIT' 'OFL-1.1')
 arch=('x86_64' 'aarch64')
 depends=('glib2' 'libglvnd' 'libxkbcommon' 'wayland' 'libx11' 'libxcb' 'xdg-desktop-portal')
 makedepends=('cargo')
@@ -19,5 +20,6 @@ package() {
     install -Dm755 "${CARGO_TARGET_DIR:-target}/release/corolla" "$pkgdir/usr/bin/corolla"
     install -Dm644 packaging/corolla.desktop "$pkgdir/usr/share/applications/corolla.desktop"
     install -Dm644 packaging/corolla.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/corolla.svg"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/corolla/LICENSE"
     install -Dm644 assets/Inter-LICENSE.txt "$pkgdir/usr/share/licenses/corolla/Inter-OFL.txt"
 }

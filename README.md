@@ -38,3 +38,7 @@ Drag a petal or inspector row to the collector. Open the collector to review or 
 | ? / Q | Show shortcuts / quit |
 
 For a disk-usage report without opening a window, run `corolla scan --json DIRECTORY`. It prints the same allocated-byte totals used by the map, immediate children in size order, and the count of unreadable entries.
+
+## License
+
+Corolla is distributed under the [MIT License](LICENSE). The bundled Inter font is distributed under the [SIL Open Font License 1.1](assets/Inter-LICENSE.txt).
