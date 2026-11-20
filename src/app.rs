@@ -1,5 +1,6 @@
 use crate::cache::{self, CacheClient, CacheWorker};
 use crate::chart::{Chart, ChartEvent};
+use crate::history::{self, store::Revision};
 use crate::patch::Changes;
 use crate::scan::{self, Scan, Volume};
 
@@ -227,6 +228,50 @@ fn drag_end(input: &egui::InputState) -> DragEnd {
     }
 }
 
+const HISTORY_LIMIT: usize = 50;
+type HistoryResult = std::io::Result<Option<Vec<Revision>>>;
+
+struct FileHistory {
+    path: PathBuf,
+    is_dir: bool,
+    query: HistoryQuery,
+}
+
+enum HistoryQuery {
+    Loading(Receiver<HistoryResult>),
+    Loaded(HistoryResult),
+}
+
+impl HistoryQuery {
+    fn query(ctx: &Context, path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let revisions = history::database_path().and_then(|db| {
+                if !db.try_exists()? {
+                    return Ok(None);
+                }
+                history::store::history(&db, Some(&path), HISTORY_LIMIT).map(Some)
+            });
+            let _ = tx.send(revisions);
+            ctx.request_repaint();
+        });
+        Self::Loading(rx)
+    }
+
+    fn poll(&mut self) {
+        if let Self::Loading(rx) = self {
+            match rx.try_recv() {
+                Ok(result) => *self = Self::Loaded(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *self = Self::Loaded(Err(std::io::Error::other("History lookup stopped.")));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Dialog {
     Help,
@@ -234,6 +279,7 @@ enum Dialog {
     Collector,
     Confirm(bool),
     Details(usize),
+    History(usize),
     Error,
 }
 
@@ -263,6 +309,7 @@ pub struct App {
     location: String,
     focus_location: bool,
     preview: crate::preview::Preview,
+    file_history: Option<FileHistory>,
     error: String,
     accent: Color32,
 }
@@ -311,6 +358,7 @@ impl App {
             location: String::new(),
             focus_location: false,
             preview: Default::default(),
+            file_history: None,
             error: String::new(),
             accent: crate::theme::accent(),
         };
@@ -969,6 +1017,10 @@ impl App {
                         self.dialog = Some(Dialog::Details(id));
                         ui.close();
                     }
+                    if ui.button("History…").clicked() {
+                        self.show_history(ui.ctx(), id);
+                        ui.close();
+                    }
                     if ui.button("Collect").clicked() {
                         self.collect(id);
                         ui.close();
@@ -1331,10 +1383,8 @@ impl App {
             return;
         }
         let target = self.selected.or(self.list_hover).or(self.map_hover);
-        if key(Key::Space)
-            && let Some(id) = target
-        {
-            self.dialog = Some(Dialog::Details(id));
+        if key(Key::Space) {
+            self.dialog = Some(Dialog::Details(target.unwrap_or(self.focus)));
             return;
         }
         if key(Key::Delete)
@@ -1576,6 +1626,9 @@ impl App {
         self.preview.show(ui, &path);
         ui.add_space(10.);
         ui.horizontal_wrapped(|ui| {
+            if ui.button("History…").clicked() {
+                self.show_history(ui.ctx(), id);
+            }
             if ui.button("Show in folder").clicked() {
                 let dir = path.parent().unwrap_or(&path);
                 if let Err(e) = std::process::Command::new("xdg-open")
@@ -1592,6 +1645,82 @@ impl App {
             {
                 self.dialog = None;
                 self.collect(id);
+            }
+            if ui.button("Done").clicked() {
+                self.dialog = None;
+            }
+        });
+    }
+    fn show_history(&mut self, ctx: &Context, id: usize) {
+        if let Some(scan) = &self.scan {
+            let path = scan.path(id);
+            self.file_history = Some(FileHistory {
+                query: HistoryQuery::query(ctx, path.clone()),
+                path,
+                is_dir: scan.nodes[id].is_dir,
+            });
+            self.dialog = Some(Dialog::History(id));
+        }
+    }
+
+    fn history_dialog(&mut self, ui: &mut Ui, id: usize) {
+        let Some(history) = &mut self.file_history else {
+            return;
+        };
+        let path = &history.path;
+        ui.heading(if history.is_dir {
+            "Folder history"
+        } else {
+            "File history"
+        });
+        ui.add(egui::Label::new(RichText::new(path.to_string_lossy()).color(MUTED)).wrap());
+        ui.add_space(9.);
+        history.query.poll();
+        let loading = matches!(history.query, HistoryQuery::Loading(_));
+        match &history.query {
+            HistoryQuery::Loading(_) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading history…");
+                });
+            }
+            HistoryQuery::Loaded(Ok(None)) => {
+                ui.label("Start a watcher to record file history for a directory.");
+                ui.code("corolla history watch DIRECTORY");
+            }
+            HistoryQuery::Loaded(Ok(Some(revisions))) if revisions.is_empty() => {
+                ui.label("No recorded changes for this path.");
+                ui.weak("History covers the directory selected by the watcher.");
+            }
+            HistoryQuery::Loaded(Ok(Some(revisions))) => {
+                if revisions.len() == HISTORY_LIMIT {
+                    ui.weak(format!("Latest {HISTORY_LIMIT} changes"));
+                }
+                ScrollArea::vertical()
+                    .id_salt(("history", path))
+                    .max_height((ui.ctx().screen_rect().height() * 0.45).min(360.))
+                    .show(ui, |ui| {
+                        for revision in revisions.iter() {
+                            revision_row(ui, revision, path);
+                        }
+                    });
+            }
+            HistoryQuery::Loaded(Err(error)) => {
+                ui.label("Couldn’t read file history.");
+                ui.add(egui::Label::new(RichText::new(error.to_string()).color(MUTED)).wrap());
+            }
+        }
+        ui.add_space(10.);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!loading, Button::new("Refresh")).clicked() {
+                history.query = HistoryQuery::query(ui.ctx(), history.path.clone());
+            }
+            let same_item = self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| id < scan.nodes.len() && scan.path(id) == history.path);
+            if ui.add_enabled(same_item, Button::new("Details")).clicked() {
+                self.dialog = Some(Dialog::Details(id));
             }
             if ui.button("Done").clicked() {
                 self.dialog = None;
@@ -1629,11 +1758,15 @@ impl App {
                     Dialog::Collector => self.collector_dialog(ctx, ui),
                     Dialog::Confirm(permanent) => self.confirm_dialog(ctx, ui, permanent),
                     Dialog::Details(id) => self.details_dialog(ui, id),
+                    Dialog::History(id) => self.history_dialog(ui, id),
                     Dialog::Error => self.error_dialog(ctx, ui),
                 }
             });
         if result.should_close() && self.dialog == Some(dialog) {
             self.dialog = None;
+        }
+        if !matches!(self.dialog, Some(Dialog::History(_))) {
+            self.file_history = None;
         }
     }
 }
@@ -1676,6 +1809,57 @@ impl eframe::App for App {
             });
         self.dialogs(ctx);
     }
+}
+
+fn revision_row(ui: &mut Ui, revision: &Revision, selected: &Path) {
+    let (action, color) = match revision.action.as_str() {
+        "added" => ("Added", MINT),
+        "removed" => ("Removed", Color32::from_rgb(250, 154, 166)),
+        "modified" => ("Modified", BLUE),
+        other => (other, TEXT),
+    };
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.colored_label(color, action);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(&revision.date).size(13.).color(MUTED))
+                .on_hover_text(format!("Commit {}", revision.commit));
+        });
+    });
+    if revision.path != selected {
+        let name = revision
+            .path
+            .strip_prefix(selected)
+            .unwrap_or(&revision.path);
+        ui.add(egui::Label::new(name.to_string_lossy()).truncate())
+            .on_hover_text(revision.path.display().to_string());
+    }
+    let current = revision.after.as_ref().or(revision.before.as_ref());
+    if let Some(meta) = current {
+        let mut value = if meta.kind == "directory" {
+            "Directory".to_owned()
+        } else if let (Some(old), Some(new)) = (&revision.before, &revision.after)
+            && old.size != new.size
+        {
+            format!("Size  {} → {}", size(old.size), size(new.size))
+        } else {
+            format!("Size  {}", size(meta.size))
+        };
+        if let (Some(old), Some(new)) = (&revision.before, &revision.after) {
+            let old_mode = old.mode & 0o7777;
+            let new_mode = new.mode & 0o7777;
+            if old_mode != new_mode {
+                value.push_str(&format!("  ·  mode {old_mode:04o} → {new_mode:04o}"));
+            }
+        }
+        ui.label(RichText::new(value).size(13.).color(MUTED))
+            .on_hover_text(format!(
+                "{} on disk  ·  mode {:04o}",
+                size(meta.bytes),
+                meta.mode & 0o7777
+            ));
+    }
+    ui.add_space(3.);
 }
 
 fn plural(count: usize, unit: &str) -> String {
@@ -1930,6 +2114,39 @@ mod tests {
                 }
             })
             .unwrap_or_else(|| panic!("missing visible text: {needle}"))
+    }
+
+    #[test]
+    fn history_view_distinguishes_initial_setup_from_an_empty_path_and_a_read_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = App::initialize(&ctx, None);
+        let path = tmp.path().join("example");
+        let frame = |app: &mut App| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.history_dialog(ui, 1));
+            })
+        };
+        let (send, recv) = mpsc::channel();
+        app.file_history = Some(FileHistory {
+            path: path.clone(),
+            is_dir: false,
+            query: HistoryQuery::Loading(recv),
+        });
+        text_position(&frame(&mut app), "Loading history…");
+        // The old picked path must still be displayed after its scan is replaced.
+        app.scan = Some(Arc::new(
+            scan::scan(tmp.path(), &AtomicBool::new(false), |_, _| {}).unwrap(),
+        ));
+        send.send(Ok(None)).unwrap();
+        let result = frame(&mut app);
+        text_position(&result, &path.to_string_lossy());
+        text_position(&result, "corolla history watch DIRECTORY");
+        app.file_history.as_mut().unwrap().query = HistoryQuery::Loaded(Ok(Some(Vec::new())));
+        text_position(&frame(&mut app), "No recorded changes for this path.");
+        app.file_history.as_mut().unwrap().query =
+            HistoryQuery::Loaded(Err(std::io::Error::other("cannot read database")));
+        text_position(&frame(&mut app), "cannot read database");
     }
 
     #[test]

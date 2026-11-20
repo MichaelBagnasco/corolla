@@ -39,6 +39,47 @@ Drag a petal or inspector row to the collector. While you hold a folder, its bra
 
 For a disk-usage report without opening a window, run `corolla scan --json DIRECTORY`. It prints the same allocated-byte totals used by the map, immediate children in size order, and the count of unreadable entries.
 
+## File history (proof of concept)
+
+Run a watcher to record changes made by any application under a directory you choose. The GUI can be closed. The first run commits a baseline to a local DoltLite database. Following commits record changes to paths, file types, logical and allocated sizes, timestamps and Unix metadata. File contents are never copied, so these revisions cannot restore a deleted file.
+
+Install the `doltlite` executable on your PATH and build this branch with `bin/install`. Only file history requires DoltLite. This POC has been tested with [DoltLite v0.51.14](https://github.com/dolthub/doltlite/releases/tag/v0.51.14).
+
+```sh
+# Terminal 1
+corolla history watch "$HOME/Documents"
+
+# Terminal 2, after the watcher reports ready
+corolla history log
+corolla history log "$HOME/Documents/notes.txt"
+```
+
+The log shows the latest 100 matching path changes, including deleted paths. Relative paths are resolved from the watched directory. In the explorer, right-click an inspector row and choose **History…**. Folder history includes changes to descendants.
+
+The watcher uses Linux inotify. It stays on the selected mount, records symlinks as entries and groups nearby events into one commit. A rename can appear as a removal and an addition. Rapid edits can collapse into one revision, and a file created and deleted between observations can go unseen. A restart reconciles the last committed state with what is on disk. Edits that happened entirely while the watcher was stopped cannot be reconstructed.
+
+Corolla keeps one watched root per database. The default is `$XDG_STATE_HOME/corolla/history/files.dolt`, normally `~/.local/state/corolla/history/files.dolt`. To use another database, set `COROLLA_HISTORY_DB` for both the watcher and the GUI or log command. The database grows with recorded changes. It is separate from the radial map's scan cache. You can inspect the commits directly with DoltLite.
+
+```sh
+db=${COROLLA_HISTORY_DB:-${XDG_STATE_HOME:-$HOME/.local/state}/corolla/history/files.dolt}
+doltlite -readonly "$db" 'SELECT commit_hash, date, message FROM dolt_log LIMIT 10'
+```
+
+### Run the watcher at login
+
+Both installers include a systemd user service. Select an existing directory and use its escaped path as the instance name. Stop a foreground watcher on the same database first.
+
+```sh
+unit=$(systemd-escape --path --template=corolla-history@.service "$HOME/Documents")
+systemctl --user daemon-reload
+systemctl --user enable --now "$unit"
+journalctl --user -u "$unit" -n 20
+# To stop recording and disable startup
+systemctl --user disable --now "$unit"
+```
+
+The service looks for `corolla` and `doltlite` in `~/.local/bin`, `/usr/local/bin` and `/usr/bin`. To exercise the watcher, an external writer and DoltLite together on a temporary directory, run `cargo test --locked --test history -- --ignored`.
+
 ## License
 
 Corolla is distributed under the [MIT License](LICENSE). The bundled Inter font is distributed under the [SIL Open Font License 1.1](assets/Inter-LICENSE.txt).

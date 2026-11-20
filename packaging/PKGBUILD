@@ -18,6 +18,7 @@ build() {
 package() {
     cd "$pkgname-$pkgver"
     install -Dm755 "${CARGO_TARGET_DIR:-target}/release/corolla" "$pkgdir/usr/bin/corolla"
+    install -Dm644 packaging/corolla-history@.service "$pkgdir/usr/lib/systemd/user/corolla-history@.service"
     install -Dm644 packaging/corolla.desktop "$pkgdir/usr/share/applications/corolla.desktop"
     install -Dm644 packaging/corolla.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/corolla.svg"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/corolla/LICENSE"

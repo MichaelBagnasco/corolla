@@ -3,6 +3,7 @@ mod cache;
 mod chart;
 mod cleanup;
 mod favorites;
+mod history;
 mod patch;
 mod preview;
 mod scan;
@@ -45,6 +46,9 @@ fn scan_summary(path: &Path) -> std::io::Result<()> {
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let initial = args.next();
+    if initial.as_deref().is_some_and(|arg| arg == "history") {
+        return history::command(&args.collect::<Vec<_>>());
+    }
     if initial.as_deref().is_some_and(|arg| arg == "scan") {
         let rest: Vec<_> = args.by_ref().collect();
         if let [flag, path] = rest.as_slice()
@@ -68,7 +72,7 @@ fn main() -> ExitCode {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Corolla — radial disk explorer\n\nUsage: corolla [DIRECTORY]\n       corolla scan --json DIRECTORY"
+            "Corolla — radial disk explorer\n\nUsage: corolla [DIRECTORY]\n       corolla scan --json DIRECTORY\n       corolla history watch DIRECTORY\n       corolla history log [PATH]"
         );
         return ExitCode::SUCCESS;
     }

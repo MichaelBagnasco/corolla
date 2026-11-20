@@ -8,7 +8,7 @@ project="$PWD"
 builddir="$(mktemp -d)"
 trap 'rm -rf "$builddir"' EXIT
 version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
-tar czf "$builddir/corolla-$version.tar.gz" --transform="s,^,corolla-$version/," Cargo.{toml,lock} LICENSE src assets packaging/corolla.{desktop,svg}
+tar czf "$builddir/corolla-$version.tar.gz" --transform="s,^,corolla-$version/," Cargo.{toml,lock} LICENSE src assets packaging/corolla.{desktop,svg} packaging/corolla-history@.service
 cp packaging/PKGBUILD "$builddir/"
 cd "$builddir"
 export PKGDEST="$project/packaging"

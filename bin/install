@@ -8,6 +8,7 @@ cargo build --locked --release
 prefix="${PREFIX:-$HOME/.local}"
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 install -Dm755 target/release/corolla "$prefix/bin/corolla"
+install -Dm644 packaging/corolla-history@.service "$data/systemd/user/corolla-history@.service"
 install -Dm644 packaging/corolla.svg "$data/icons/hicolor/scalable/apps/corolla.svg"
 install -Dm644 LICENSE "$data/licenses/corolla/LICENSE"
 install -Dm644 assets/Inter-LICENSE.txt "$data/licenses/corolla/Inter-OFL.txt"
