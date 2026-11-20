@@ -8,6 +8,25 @@ use std::{
 
 const COROLLA: &str = env!("CARGO_BIN_EXE_corolla");
 
+#[test]
+fn snapshot_discovery_works_without_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("unused.dolt");
+    let output = Command::new(COROLLA)
+        .env("COROLLA_HISTORY_DB", &db)
+        .env("DOLTLITE_BIN", tmp.path().join("absent"))
+        .args(["history", "snapshots", "/proc/version"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("non-Btrfs"));
+    assert!(!db.exists());
+}
+
 struct Watcher(Child);
 
 impl Watcher {

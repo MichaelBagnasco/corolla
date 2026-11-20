@@ -54,11 +54,11 @@ pub struct Volume {
     pub fs_type: String,
 }
 
-struct Mount {
-    id: u64,
-    path: PathBuf,
-    root: PathBuf,
-    fs_type: String,
+pub(crate) struct Mount {
+    pub(crate) id: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) fs_type: String,
     source: OsString,
     device: OsString,
 }
@@ -101,7 +101,7 @@ fn parse_mount(line: &[u8]) -> Option<Mount> {
     })
 }
 
-fn mounts() -> io::Result<Vec<Mount>> {
+pub(crate) fn mounts() -> io::Result<Vec<Mount>> {
     let data = fs::read("/proc/self/mountinfo")?;
     let mut table: Vec<_> = data
         .split(|c| *c == b'\n')

@@ -551,6 +551,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "libloading",
  "rfd",
  "serde_json",
  "tempfile",

@@ -114,6 +114,7 @@ struct Watcher {
     names: HashMap<i32, PathBuf>,
     watches: BTreeMap<PathBuf, i32>,
     anchor: Option<PathBuf>,
+    snapshots: BTreeSet<PathBuf>,
 }
 
 fn missing(error: &io::Error) -> bool {
@@ -157,6 +158,7 @@ impl Watcher {
             names: HashMap::new(),
             watches: BTreeMap::new(),
             anchor: None,
+            snapshots: BTreeSet::new(),
         })
     }
 
@@ -274,7 +276,10 @@ impl Watcher {
             preserved: Vec::new(),
         };
         for path in paths {
-            if !path.starts_with(&self.root) || self.ignored.contains(path) {
+            if !path.starts_with(&self.root)
+                || self.ignored.contains(path)
+                || path.ancestors().skip(1).any(|p| self.snapshots.contains(p))
+            {
                 continue;
             }
             if batch
@@ -296,6 +301,17 @@ impl Watcher {
         };
         let mut parents = BTreeSet::new();
         for scope in batch.scopes.clone() {
+            // A path can cease to be a snapshot after a removal or replacement.
+            // Rediscover boundaries within this scope along with its watches.
+            let old_snapshots: Vec<_> = self
+                .snapshots
+                .range(scope.clone()..)
+                .take_while(|p| p.starts_with(&scope))
+                .cloned()
+                .collect();
+            for path in old_snapshots {
+                self.snapshots.remove(&path);
+            }
             // Reconcile subscriptions at the same time as data. Watches tied to
             // moved inodes must no longer describe their previous paths.
             let mut stale: BTreeSet<_> = self
@@ -324,6 +340,10 @@ impl Watcher {
                     // directory metadata and preserve its unobservable descendants.
                     self.add_row(&mut batch, path.clone(), &meta);
                     if meta.is_dir() {
+                        if path != self.root && super::btrfs::nested_snapshot(&file, &meta)? {
+                            self.snapshots.insert(path.clone());
+                            return Ok(());
+                        }
                         self.watch(&path, &file)?;
                         stale.remove(&path);
                         let entries = fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))?;

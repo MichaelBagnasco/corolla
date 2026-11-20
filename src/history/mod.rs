@@ -1,3 +1,4 @@
+pub mod btrfs;
 pub mod store;
 mod watch;
 
@@ -11,7 +12,7 @@ use std::{
     process::ExitCode,
 };
 
-const USAGE: &str = "Usage: corolla history watch DIRECTORY\n       corolla history log [PATH]";
+pub const USAGE: &str = "Usage: corolla history watch DIRECTORY\n       corolla history log [PATH]\n       corolla history snapshots PATH";
 
 pub fn database_path() -> io::Result<PathBuf> {
     if let Some(custom) = env::var_os("COROLLA_HISTORY_DB").filter(|s| !s.is_empty()) {
@@ -119,11 +120,41 @@ fn log(path: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+fn snapshots(path: &Path) -> io::Result<()> {
+    let report = btrfs::discover(path)?;
+    let mut out = io::stdout().lock();
+    let Some(source) = report.source else {
+        return writeln!(out, "The selected path is on a non-Btrfs filesystem.");
+    };
+    writeln!(out, "Source subvolume  {source:?}")?;
+    if report.checkpoints.is_empty() {
+        writeln!(out, "No accessible snapshots matched this subvolume.")?;
+    }
+    for checkpoint in report.checkpoints {
+        let mode = if checkpoint.readonly {
+            "read-only"
+        } else {
+            "writable"
+        };
+        writeln!(out, "{}  {mode:9}  {:?}", checkpoint.date, checkpoint.root)?;
+        if let Some(file) = checkpoint.file {
+            writeln!(out, "  Path in snapshot  {file:?}")?;
+        } else {
+            writeln!(out, "  Path unavailable in this snapshot")?;
+        }
+    }
+    if report.limited {
+        writeln!(out, "Mounts or permissions may hide other snapshots.")?;
+    }
+    Ok(())
+}
+
 pub fn command(args: &[OsString]) -> ExitCode {
     let result = match args {
         [cmd, path] if cmd == "watch" => record(Path::new(path)),
         [cmd] if cmd == "log" => log(None),
         [cmd, path] if cmd == "log" => log(Some(Path::new(path))),
+        [cmd, path] if cmd == "snapshots" => snapshots(Path::new(path)),
         [flag] if flag == "--help" || flag == "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -135,7 +166,12 @@ pub fn command(args: &[OsString]) -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) if args[0] == "log" && e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e)
+            if matches!(args[0].to_str(), Some("log" | "snapshots"))
+                && e.kind() == io::ErrorKind::BrokenPipe =>
+        {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("corolla history: {e}");
             ExitCode::FAILURE

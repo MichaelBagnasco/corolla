@@ -72,7 +72,8 @@ fn main() -> ExitCode {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Corolla — radial disk explorer\n\nUsage: corolla [DIRECTORY]\n       corolla scan --json DIRECTORY\n       corolla history watch DIRECTORY\n       corolla history log [PATH]"
+            "Corolla — radial disk explorer\n\nUsage: corolla [DIRECTORY]\n       corolla scan --json DIRECTORY\n\n{}",
+            history::USAGE
         );
         return ExitCode::SUCCESS;
     }

@@ -1,6 +1,6 @@
 use crate::cache::{self, CacheClient, CacheWorker};
 use crate::chart::{Chart, ChartEvent};
-use crate::history::{self, store::Revision};
+use crate::history::{self, btrfs, store::Revision};
 use crate::patch::Changes;
 use crate::scan::{self, Scan, Volume};
 
@@ -229,31 +229,24 @@ fn drag_end(input: &egui::InputState) -> DragEnd {
 }
 
 const HISTORY_LIMIT: usize = 50;
-type HistoryResult = std::io::Result<Option<Vec<Revision>>>;
-
 struct FileHistory {
     path: PathBuf,
     is_dir: bool,
-    query: HistoryQuery,
+    query: HistoryQuery<Option<Vec<Revision>>>,
+    snapshots: Option<HistoryQuery<btrfs::Report>>,
 }
 
-enum HistoryQuery {
-    Loading(Receiver<HistoryResult>),
-    Loaded(HistoryResult),
+enum HistoryQuery<T> {
+    Loading(Receiver<std::io::Result<T>>),
+    Loaded(std::io::Result<T>),
 }
 
-impl HistoryQuery {
-    fn query(ctx: &Context, path: PathBuf) -> Self {
+impl<T: Send + 'static> HistoryQuery<T> {
+    fn start(ctx: &Context, work: impl FnOnce() -> std::io::Result<T> + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let revisions = history::database_path().and_then(|db| {
-                if !db.try_exists()? {
-                    return Ok(None);
-                }
-                history::store::history(&db, Some(&path), HISTORY_LIMIT).map(Some)
-            });
-            let _ = tx.send(revisions);
+            let _ = tx.send(work());
             ctx.request_repaint();
         });
         Self::Loading(rx)
@@ -270,6 +263,20 @@ impl HistoryQuery {
             }
         }
     }
+}
+
+fn query_revisions(ctx: &Context, path: PathBuf) -> HistoryQuery<Option<Vec<Revision>>> {
+    HistoryQuery::start(ctx, move || {
+        let db = history::database_path()?;
+        if !db.try_exists()? {
+            return Ok(None);
+        }
+        history::store::history(&db, Some(&path), HISTORY_LIMIT).map(Some)
+    })
+}
+
+fn query_snapshots(ctx: &Context, path: PathBuf) -> HistoryQuery<btrfs::Report> {
+    HistoryQuery::start(ctx, move || btrfs::discover(&path))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1655,7 +1662,8 @@ impl App {
         if let Some(scan) = &self.scan {
             let path = scan.path(id);
             self.file_history = Some(FileHistory {
-                query: HistoryQuery::query(ctx, path.clone()),
+                query: query_revisions(ctx, path.clone()),
+                snapshots: None,
                 path,
                 is_dir: scan.nodes[id].is_dir,
             });
@@ -1667,6 +1675,50 @@ impl App {
         let Some(history) = &mut self.file_history else {
             return;
         };
+        if let Some(query) = &mut history.snapshots {
+            ui.heading("Btrfs snapshots");
+            ui.add(
+                egui::Label::new(RichText::new(history.path.to_string_lossy()).color(MUTED)).wrap(),
+            );
+            ui.add_space(9.);
+            query.poll();
+            match query {
+                HistoryQuery::Loading(_) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Looking for snapshots…");
+                    });
+                }
+                HistoryQuery::Loaded(Ok(report)) => snapshot_report(ui, report),
+                HistoryQuery::Loaded(Err(error)) => {
+                    ui.label("Couldn’t list Btrfs snapshots.");
+                    ui.weak(error.to_string());
+                }
+            }
+            ui.add_space(10.);
+            let back = ui
+                .horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            matches!(query, HistoryQuery::Loaded(_)),
+                            Button::new("Refresh"),
+                        )
+                        .clicked()
+                    {
+                        *query = query_snapshots(ui.ctx(), history.path.clone());
+                    }
+                    let back = ui.button("Back to history").clicked();
+                    if ui.button("Done").clicked() {
+                        self.dialog = None;
+                    }
+                    back
+                })
+                .inner;
+            if back {
+                history.snapshots = None;
+            }
+            return;
+        }
         let path = &history.path;
         ui.heading(if history.is_dir {
             "Folder history"
@@ -1711,9 +1763,12 @@ impl App {
             }
         }
         ui.add_space(10.);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!loading, Button::new("Refresh")).clicked() {
-                history.query = HistoryQuery::query(ui.ctx(), history.path.clone());
+                history.query = query_revisions(ui.ctx(), history.path.clone());
+            }
+            if ui.button("Btrfs snapshots…").clicked() {
+                history.snapshots = Some(query_snapshots(ui.ctx(), history.path.clone()));
             }
             let same_item = self
                 .scan
@@ -1809,6 +1864,66 @@ impl eframe::App for App {
             });
         self.dialogs(ctx);
     }
+}
+
+fn snapshot_report(ui: &mut Ui, report: &btrfs::Report) {
+    let Some(source) = &report.source else {
+        ui.label("Btrfs snapshots are unavailable on this filesystem.");
+        return;
+    };
+    ui.label(format!("Source subvolume  {}", source.display()));
+    if report.limited {
+        ui.weak("Mounts or permissions may limit which snapshots are visible.");
+    }
+    if report.checkpoints.is_empty() {
+        ui.label("No accessible matching snapshots.");
+        return;
+    }
+    ScrollArea::vertical()
+        .id_salt(("btrfs snapshots", source))
+        .max_height((ui.ctx().screen_rect().height() * 0.45).min(360.))
+        .show(ui, |ui| {
+            for checkpoint in &report.checkpoints {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&checkpoint.date);
+                    ui.weak(if checkpoint.readonly {
+                        "Read-only"
+                    } else {
+                        "Writable"
+                    });
+                });
+                ui.add(egui::Label::new(checkpoint.root.to_string_lossy()).truncate())
+                    .on_hover_text(checkpoint.root.display().to_string());
+                if let Some(file) = &checkpoint.file {
+                    ui.horizontal(|ui| {
+                        let path = file.to_str();
+                        if ui
+                            .add_enabled(path.is_some(), Button::new("Copy path").small())
+                            .on_disabled_hover_text(
+                                "The path contains bytes that can’t be copied as text.",
+                            )
+                            .clicked()
+                            && let Some(path) = path
+                        {
+                            ui.ctx().copy_text(path.to_owned());
+                        }
+                        if file != &checkpoint.root {
+                            let relative = file.strip_prefix(&checkpoint.root).unwrap_or(file);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(relative.to_string_lossy()).color(MUTED),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(file.display().to_string());
+                        }
+                    });
+                } else {
+                    ui.weak("Selected path is absent or inaccessible in this snapshot.");
+                }
+            }
+        });
 }
 
 fn revision_row(ui: &mut Ui, revision: &Revision, selected: &Path) {
@@ -2132,6 +2247,7 @@ mod tests {
             path: path.clone(),
             is_dir: false,
             query: HistoryQuery::Loading(recv),
+            snapshots: None,
         });
         text_position(&frame(&mut app), "Loading history…");
         // The old picked path must still be displayed after its scan is replaced.
@@ -2147,6 +2263,86 @@ mod tests {
         app.file_history.as_mut().unwrap().query =
             HistoryQuery::Loaded(Err(std::io::Error::other("cannot read database")));
         text_position(&frame(&mut app), "cannot read database");
+    }
+
+    #[test]
+    fn snapshots_are_reachable_without_a_watcher_and_show_entry_availability() {
+        let ctx = Context::default();
+        let mut app = App::initialize(&ctx, None);
+        app.file_history = Some(FileHistory {
+            path: PathBuf::from("/proc/self/status"),
+            is_dir: false,
+            query: HistoryQuery::Loaded(Ok(None)),
+            snapshots: None,
+        });
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.history_dialog(ui, 1));
+                },
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            let pos = text_position(&frame(app, vec![]), label);
+            frame(app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+            frame(app, vec![button(pos, false)])
+        };
+
+        click(&mut app, "Btrfs snapshots…");
+        let snapshots = &mut app.file_history.as_mut().unwrap().snapshots;
+        let Some(HistoryQuery::Loading(rx)) = snapshots.take() else {
+            panic!("snapshot lookup should start on demand");
+        };
+        *snapshots = Some(HistoryQuery::Loaded(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ));
+        text_position(
+            &frame(&mut app, vec![]),
+            "Btrfs snapshots are unavailable on this filesystem.",
+        );
+        let file = PathBuf::from("/snapshots/earlier/status");
+        let checkpoints = vec![
+            btrfs::Checkpoint {
+                root: PathBuf::from("/snapshots/earlier"),
+                date: "2026-01-02T00:00:00Z".into(),
+                readonly: true,
+                file: Some(file.clone()),
+            },
+            btrfs::Checkpoint {
+                root: PathBuf::from("/snapshots/old"),
+                date: "2026-01-01T00:00:00Z".into(),
+                readonly: false,
+                file: None,
+            },
+        ];
+        app.file_history.as_mut().unwrap().snapshots =
+            Some(HistoryQuery::Loaded(Ok(btrfs::Report {
+                source: Some(PathBuf::from("/proc/self")),
+                limited: true,
+                checkpoints,
+            })));
+        let report = frame(&mut app, vec![]);
+        text_position(
+            &report,
+            "Mounts or permissions may limit which snapshots are visible.",
+        );
+        text_position(&report, "Read-only");
+        text_position(&report, "Writable");
+        text_position(
+            &report,
+            "Selected path is absent or inaccessible in this snapshot.",
+        );
+        let copied = click(&mut app, "Copy path");
+        assert!(copied.platform_output.commands.iter().any(
+            |c| matches!(c, egui::OutputCommand::CopyText(s) if s == &file.to_string_lossy())
+        ));
+
+        click(&mut app, "Back to history");
+        text_position(&frame(&mut app, vec![]), "corolla history watch DIRECTORY");
     }
 
     #[test]

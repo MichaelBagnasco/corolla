@@ -43,7 +43,7 @@ For a disk-usage report without opening a window, run `corolla scan --json DIREC
 
 Run a watcher to record changes made by any application under a directory you choose. The GUI can be closed. The first run commits a baseline to a local DoltLite database. Following commits record changes to paths, file types, logical and allocated sizes, timestamps and Unix metadata. File contents are never copied, so these revisions cannot restore a deleted file.
 
-Install the `doltlite` executable on your PATH and build this branch with `bin/install`. Only file history requires DoltLite. This POC has been tested with [DoltLite v0.51.14](https://github.com/dolthub/doltlite/releases/tag/v0.51.14).
+Install the `doltlite` executable on your PATH (or set `DOLTLITE_BIN` to its location) and build this branch with `bin/install`. The watcher and metadata log use DoltLite. This POC has been tested with [DoltLite v0.51.14](https://github.com/dolthub/doltlite/releases/tag/v0.51.14).
 
 ```sh
 # Terminal 1
@@ -57,6 +57,8 @@ corolla history log "$HOME/Documents/notes.txt"
 The log shows the latest 100 matching path changes, including deleted paths. Relative paths are resolved from the watched directory. In the explorer, right-click an inspector row and choose **History…**. Folder history includes changes to descendants.
 
 The watcher uses Linux inotify. It stays on the selected mount, records symlinks as entries and groups nearby events into one commit. A rename can appear as a removal and an addition. Rapid edits can collapse into one revision, and a file created and deleted between observations can go unseen. A restart reconciles the last committed state with what is on disk. Edits that happened entirely while the watcher was stopped cannot be reconstructed.
+
+On Btrfs, the watcher records a nested snapshot as a directory entry and skips its archived contents. It still follows live subvolumes on the same mount. You can explicitly select a snapshot as the watch root.
 
 Corolla keeps one watched root per database. The default is `$XDG_STATE_HOME/corolla/history/files.dolt`, normally `~/.local/state/corolla/history/files.dolt`. To use another database, set `COROLLA_HISTORY_DB` for both the watcher and the GUI or log command. The database grows with recorded changes. It is separate from the radial map's scan cache. You can inspect the commits directly with DoltLite.
 
@@ -79,6 +81,18 @@ systemctl --user disable --now "$unit"
 ```
 
 The service looks for `corolla` and `doltlite` in `~/.local/bin`, `/usr/local/bin` and `/usr/bin`. To exercise the watcher, an external writer and DoltLite together on a temporary directory, run `cargo test --locked --test history -- --ignored`.
+
+### Find earlier copies in Btrfs snapshots
+
+Choose **Btrfs snapshots…** in the History view, or run the command below for a file or folder. Discovery works independently of the watcher and the DoltLite database, including for snapshots taken before Corolla was installed. On Arch, `btrfs-progs` supplies the required `libbtrfsutil` library.
+
+```sh
+corolla history snapshots "$HOME/Documents/notes.txt"
+```
+
+Corolla looks for accessible, direct snapshots of the subvolume containing the path. Each match shows its creation time, whether it is read-only or writable, and where the selected path can be found inside it. A writable snapshot may have changed since creation. A deleted or renamed file may be available under its old name. For a symbolic link, **Copy path** gives you the location of the link itself.
+
+Btrfs snapshots cover a single subvolume. For example, a snapshot of `/` does not capture files in a separate `/home` subvolume. Other mounts and directory permissions can limit discovery. Snapshot creation and retention stay with your existing tools, such as Snapper. [Btrfs subvolume documentation](https://btrfs.readthedocs.io/en/latest/Subvolumes.html)
 
 ## License
 
