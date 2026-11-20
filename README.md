@@ -16,7 +16,7 @@ To build and install for your user, run `bin/install` with a stable Rust toolcha
 
 For a pacman-managed installation, `bin/package` creates an Arch package in `packaging/`. Install that file with `sudo pacman -U`. Use `cargo test --release --locked` to run the tests.
 
-Corolla keeps completed scans so you can reopen disks, folders, and their scanned subfolders, even after quitting. The map shows the last scan. Press **R** or click **Rescan** to pick up changes made elsewhere. Recent maps are saved privately in `$XDG_CACHE_HOME/corolla/scans` (normally `~/.cache/corolla/scans`). The disk cache holds up to 12 maps within 512 MiB. Very large maps that exceed the snapshot limits remain available in memory during the session. The command-line JSON report always scans the filesystem.
+Corolla keeps completed scans so you can reopen disks, folders, and their scanned subfolders, even after quitting. The map shows the last scan. Press **R** or click **Rescan** to pick up changes made elsewhere. You can cancel a rescan and keep exploring the previous map. Refreshing a subfolder updates its branch in cached parent maps. Recent maps are saved privately in `$XDG_CACHE_HOME/corolla/scans` (normally `~/.cache/corolla/scans`). The disk cache holds up to 12 maps within 512 MiB. Very large maps that exceed the snapshot limits remain available in memory during the session. The command-line JSON report always scans the filesystem.
 
 ## Explore and clean up
 

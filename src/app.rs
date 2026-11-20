@@ -1,15 +1,16 @@
-use crate::cache::ScanCache;
+use crate::cache::{self, CacheClient, CacheWorker};
 use crate::chart::{Chart, ChartEvent};
+use crate::patch::Changes;
 use crate::scan::{self, Scan, Volume};
-use crate::snapshots;
+
 use egui::{
     self, Align, Align2, Button, Color32, Context, FontId, Frame, Id, Key, Layout, Modal, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
 };
-use std::collections::HashSet;
+
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
@@ -46,7 +47,8 @@ struct Opened {
     scan: Arc<Scan>,
     focus: usize,
     cached: bool,
-    save_epoch: Option<u64>,
+    fresh: bool,
+    generation: Option<u64>,
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -58,91 +60,94 @@ enum Update {
     Done(std::io::Result<Opened>),
 }
 
-#[derive(Default)]
-struct Memory {
-    scans: ScanCache,
-    generation: Option<u64>,
-}
-impl Memory {
-    fn synchronize(&mut self, generation: Option<u64>) {
-        if self.generation != generation {
-            self.scans = ScanCache::default();
-            self.generation = generation;
-        }
-    }
-
-    fn invalidate(&mut self, path: &Path) {
-        if let Some((before, after)) = snapshots::invalidate(path) {
-            self.synchronize(Some(before));
-            self.generation = Some(after);
-        }
-        self.scans.invalidate(path);
-    }
-}
-
-// Cache validation, filesystem traversal, and serialization all run on the worker.
 fn open_scan(
     root: &Path,
     fresh: bool,
     cancel: &AtomicBool,
-    memory: &Mutex<Memory>,
+    cache: &CacheClient,
     notify: impl Fn(Update),
 ) -> std::io::Result<Opened> {
-    // Explicit invalidation also covers a location which disappeared since scanning.
-    let canonical = root.canonicalize();
-    if fresh {
-        memory
-            .lock()
-            .unwrap()
-            .invalidate(canonical.as_deref().unwrap_or(root));
-    }
-    let root = canonical?;
-    let (generation, remembered) = {
-        let mut memory = memory.lock().unwrap();
-        let generation = snapshots::generation();
-        memory.synchronize(generation);
-        let hit = if fresh { None } else { memory.scans.get(&root) };
-        (generation, hit)
+    let root = root.canonicalize()?;
+    let lookup = cache.lookup(&root, fresh)?;
+    let (scan, focus, cached) = match lookup.hit {
+        Some((scan, focus)) => (scan, focus, true),
+        None => {
+            let scan = scan::scan(&root, cancel, |n, p| notify(Update::Progress(n, p.into())))?;
+            (Arc::new(scan), 0, false)
+        }
     };
-    let opened = if let Some((scan, focus)) = remembered {
-        return Ok(Opened {
-            scan,
-            focus,
-            cached: true,
-            save_epoch: None,
+    Ok(Opened {
+        scan,
+        focus,
+        cached,
+        fresh,
+        generation: lookup.generation,
+    })
+}
+
+struct CleanupOutcome {
+    active: Option<Arc<Scan>>,
+    failed: Vec<(PathBuf, String)>,
+    diagnostics: Vec<String>,
+}
+
+fn cleanup(
+    targets: &[crate::cleanup::Target],
+    permanent: bool,
+    cache: &CacheClient,
+    active: Option<Arc<Scan>>,
+) -> CleanupOutcome {
+    let report = crate::cleanup::remove(targets, permanent);
+    let failed: std::collections::HashSet<_> = report.failed.iter().map(|(path, _)| path).collect();
+    let removed: Vec<_> = targets
+        .iter()
+        .filter(|t| !failed.contains(&t.path))
+        .map(|t| t.path.clone())
+        .collect();
+    let mut changes = Vec::new();
+    if !removed.is_empty() {
+        changes.push(Changes {
+            refreshed: None,
+            removed,
         });
-    } else if let Some((scan, focus)) = (!fresh).then(|| snapshots::load(&root)).flatten() {
-        Opened {
-            scan,
-            focus,
-            cached: true,
-            save_epoch: None,
+    }
+    let mut diagnostics = Vec::new();
+    // Only a failed recursive removal can leave a partially changed directory.
+    // Reconcile its actual contents without walking unrelated branches.
+    for path in report.recheck {
+        let remeasure = path.symlink_metadata().and_then(|meta| {
+            if !meta.is_dir() {
+                return Err(std::io::Error::other("the directory has been replaced"));
+            }
+            scan::scan(&path, &AtomicBool::new(false), |_, _| {})
+        });
+        match remeasure {
+            Ok(refreshed) => changes.push(Changes {
+                refreshed: Some(Arc::new(refreshed)),
+                removed: Vec::new(),
+            }),
+            Err(error) => diagnostics.push(format!(
+                "Could not remeasure {}. {error}. Rescan its parent folder.",
+                path.display()
+            )),
         }
-    } else {
-        let scan = Arc::new(scan::scan(&root, cancel, |n, p| {
-            notify(Update::Progress(n, p.into()))
-        })?);
-        Opened {
-            scan,
-            focus: 0,
-            cached: false,
-            save_epoch: generation,
+    }
+    let active = match cache.reconcile(changes, active) {
+        Ok(active) => active,
+        Err(error) => {
+            diagnostics.push(format!(
+                "Could not update the map. Rescan the affected location. {error}"
+            ));
+            None
         }
     };
-    // An invalidation in another worker can finish while this snapshot is being read.
-    let mut memory = memory.lock().unwrap();
-    if !cancel.load(Ordering::Relaxed)
-        && generation == snapshots::generation()
-        && memory.generation == generation
-    {
-        memory.scans.insert(opened.scan.clone());
+    CleanupOutcome {
+        active,
+        failed: report.failed,
+        diagnostics,
     }
-    Ok(opened)
 }
-struct Overview {
-    volumes: Vec<Volume>,
-    reusable: HashSet<PathBuf>,
-}
+
 struct Job {
     events: Receiver<Update>,
     phase: Phase,
@@ -174,10 +179,8 @@ enum Dialog {
 pub struct App {
     volumes: Vec<Volume>,
     pinned: Vec<PathBuf>,
-    mounts: Option<Receiver<std::io::Result<Overview>>>,
-    memory: Arc<Mutex<Memory>>,
-    reusable: HashSet<PathBuf>,
-    writers: Vec<std::thread::JoinHandle<()>>,
+    mounts: Option<Receiver<std::io::Result<Vec<Volume>>>>,
+    cache: CacheWorker,
     view_root: usize,
     cached_view: bool,
     scan: Option<Arc<Scan>>,
@@ -192,7 +195,7 @@ pub struct App {
     list_hover: Option<usize>,
     drag: Option<usize>,
     collected: Vec<Item>,
-    trash_job: Option<Receiver<Vec<(PathBuf, String)>>>,
+    trash_job: Option<Receiver<CleanupOutcome>>,
     picker: Option<Receiver<Option<PathBuf>>>,
     dialog: Option<Dialog>,
     location: String,
@@ -224,9 +227,7 @@ impl App {
             volumes: vec![],
             pinned: crate::favorites::load(),
             mounts: None,
-            memory: Arc::default(),
-            reusable: HashSet::new(),
-            writers: Vec::new(),
+            cache: CacheWorker::start(),
             view_root: 0,
             cached_view: false,
             scan: None,
@@ -263,28 +264,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         self.mounts = Some(rx);
-        let pinned = self.pinned.clone();
-        let memory = self.memory.clone();
         std::thread::spawn(move || {
-            let result = scan::volumes().map(|volumes| {
-                let roots = snapshots::roots();
-                let mut candidates = pinned;
-                candidates.extend(std::env::var_os("HOME").map(PathBuf::from));
-                candidates.extend(volumes.iter().map(|v| v.path.clone()));
-                memory.lock().unwrap().synchronize(snapshots::generation());
-                let reusable = candidates
-                    .into_iter()
-                    .filter(|path| {
-                        let Ok(canonical) = path.canonicalize() else {
-                            return false;
-                        };
-                        memory.lock().unwrap().scans.contains(&canonical)
-                            || roots.iter().any(|r| scan::can_cover(r, &canonical))
-                    })
-                    .collect();
-                Overview { volumes, reusable }
-            });
-            let _ = tx.send(result);
+            let _ = tx.send(scan::volumes());
             ctx.request_repaint();
         });
     }
@@ -293,7 +274,7 @@ impl App {
     }
 
     fn rescan(&mut self, ctx: &Context) {
-        if let Some(scan) = self.scan.take() {
+        if let Some(scan) = &self.scan {
             self.launch(ctx, scan.path(self.view_root), true);
         }
     }
@@ -304,7 +285,6 @@ impl App {
         }
         self.drag = None;
         self.dialog = None;
-        self.explorer = false;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.job = Some(Job {
@@ -316,9 +296,9 @@ impl App {
             started: Instant::now(),
         });
         let ctx = ctx.clone();
-        let memory = self.memory.clone();
+        let cache = self.cache.client.clone();
         std::thread::spawn(move || {
-            let result = open_scan(&root, fresh, &cancel, &memory, |update| {
+            let result = open_scan(&root, fresh, &cancel, &cache, |update| {
                 let _ = tx.send(update);
                 ctx.request_repaint();
             });
@@ -334,10 +314,7 @@ impl App {
         if let Some(result) = self.mounts.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.mounts = None;
             match result {
-                Ok(overview) => {
-                    self.volumes = overview.volumes;
-                    self.reusable = overview.reusable;
-                }
+                Ok(volumes) => self.volumes = volumes,
                 Err(e) => self.fail(format!("Could not list disks. {e}")),
             }
         }
@@ -363,54 +340,77 @@ impl App {
                 self.job = None;
                 match result {
                     Ok(opened) => {
-                        if let Some(epoch) = opened.save_epoch {
-                            let new_scan = opened.scan.clone();
-                            self.writers.retain(|writer| !writer.is_finished());
-                            self.writers.push(std::thread::spawn(move || {
-                                snapshots::save_if_current(&new_scan, Some(epoch));
-                            }));
+                        if !opened.cached {
+                            self.cache.client.accept(
+                                opened.scan.clone(),
+                                opened.fresh,
+                                opened.generation,
+                            );
                         }
                         self.scan = Some(opened.scan);
                         self.view_root = opened.focus;
                         self.focus = opened.focus;
                         self.cached_view = opened.cached;
-                        self.preview = Default::default();
                         self.explorer = true;
-                        self.history.clear();
-                        self.forward.clear();
-                        self.clear_hover();
-                        self.chart = Chart::default();
+                        self.reset_navigation();
                         self.refresh(ctx);
                     }
                     Err(e) => self.fail(format!("Could not scan this folder. {e}")),
                 }
             }
         }
-        if let Some(failed) = self.trash_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some(outcome) = self.trash_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.trash_job = None;
-            let affected = self.scan.as_ref().is_some_and(|scan| {
-                let view = scan.path(self.view_root);
-                self.collected.iter().any(|item| {
-                    view.starts_with(&item.target.path) || item.target.path.starts_with(&view)
-                })
-            });
-            self.collected
-                .retain(|entry| failed.iter().any(|(p, _)| *p == entry.target.path));
-            if affected {
-                self.rescan(ctx);
-            } else {
-                self.refresh(ctx);
-            }
-            if !failed.is_empty() {
-                self.fail(
-                    failed
-                        .into_iter()
-                        .map(|(p, e)| format!("{}\n{e}", p.display()))
-                        .collect::<Vec<String>>()
-                        .join("\n\n"),
-                );
-            }
+            self.finish_cleanup(outcome);
+            self.refresh(ctx);
         }
+    }
+
+    fn finish_cleanup(&mut self, outcome: CleanupOutcome) {
+        let mut messages = outcome.diagnostics;
+        self.collected
+            .retain(|entry| outcome.failed.iter().any(|(p, _)| *p == entry.target.path));
+        let old = self.scan.take();
+        self.scan = outcome.active;
+        if let (Some(old), Some(updated)) = (&old, &self.scan) {
+            if !Arc::ptr_eq(old, updated) {
+                // Patching changes arena indices. Resolve visible folders by path;
+                // a removed focus falls back to its closest surviving parent.
+                let view = old.path(self.view_root);
+                let focused = old.path(self.focus);
+                self.view_root = view
+                    .ancestors()
+                    .find_map(|p| cache::locate(updated, p))
+                    .unwrap_or(0);
+                self.focus = focused
+                    .ancestors()
+                    .find_map(|p| cache::locate(updated, p))
+                    .unwrap_or(self.view_root);
+                self.reset_navigation();
+            }
+        } else if self.scan.is_none() {
+            self.explorer = false;
+            self.view_root = 0;
+            self.focus = 0;
+            self.reset_navigation();
+        }
+        messages.extend(
+            outcome
+                .failed
+                .into_iter()
+                .map(|(p, e)| format!("{}\n{e}", p.display())),
+        );
+        if !messages.is_empty() {
+            self.fail(messages.join("\n\n"));
+        }
+    }
+
+    fn reset_navigation(&mut self) {
+        self.history.clear();
+        self.forward.clear();
+        self.clear_hover();
+        self.preview = Default::default();
+        self.chart = Chart::default();
     }
     fn clear_hover(&mut self) {
         self.selected = None;
@@ -551,15 +551,8 @@ impl App {
                     ui.label("Finding disks…");
                 }
                 for volume in &self.volumes {
-                    if volume_row(
-                        ui,
-                        &volume.name,
-                        &volume.path,
-                        Some(volume),
-                        self.accent,
-                        self.reusable.contains(&volume.path),
-                    )
-                    .clicked()
+                    if volume_row(ui, &volume.name, &volume.path, Some(volume), self.accent)
+                        .clicked()
                     {
                         target = Some(volume.path.clone());
                     }
@@ -568,16 +561,7 @@ impl App {
                     && !self.volumes.iter().any(|volume| volume.path == home)
                 {
                     ui.add_space(12.);
-                    if volume_row(
-                        ui,
-                        "Home folder",
-                        &home,
-                        None,
-                        self.accent,
-                        self.reusable.contains(&home),
-                    )
-                    .clicked()
-                    {
+                    if volume_row(ui, "Home folder", &home, None, self.accent).clicked() {
                         target = Some(home);
                     }
                 }
@@ -586,14 +570,7 @@ impl App {
                         .file_name()
                         .unwrap_or(path.as_os_str())
                         .to_string_lossy();
-                    let row = volume_row(
-                        ui,
-                        &name,
-                        path,
-                        None,
-                        self.accent,
-                        self.reusable.contains(path),
-                    );
+                    let row = volume_row(ui, &name, path, None, self.accent);
                     let rect = Rect::from_center_size(
                         row.rect.left_center() + vec2(32., 0.),
                         vec2(41., 41.),
@@ -782,9 +759,16 @@ impl App {
             });
         });
     }
+    fn volume_at(&self, scan: &Scan, focus: usize) -> Option<&Volume> {
+        if focus != self.view_root {
+            return None;
+        }
+        let path = scan.path(self.view_root);
+        self.volumes.iter().find(|v| v.path == path)
+    }
     fn inspector(&mut self, ui: &mut Ui, scan: &Scan, focus: usize) {
         let node = &scan.nodes[focus];
-        let color = if focus == 0 {
+        let color = if focus == self.view_root {
             MINT
         } else {
             self.chart.branch_color(scan, focus)
@@ -826,9 +810,7 @@ impl App {
         }
         ui.spacing_mut().item_spacing.y = 0.;
         let row_height = 26.;
-        let volume = (focus == 0)
-            .then(|| self.volumes.iter().find(|v| v.path == scan.root))
-            .flatten();
+        let volume = self.volume_at(scan, focus);
         let unmeasured = volume.map_or(0, |v| {
             v.total.saturating_sub(v.free).saturating_sub(node.bytes)
         });
@@ -922,18 +904,14 @@ impl App {
             pos2(rect.right(), rect.bottom() - 40.),
         );
         let mut plot = ui.new_child(UiBuilder::new().max_rect(map));
-        let volume = if self.focus == 0 {
-            self.volumes.iter().find(|v| v.path == scan.root)
-        } else {
-            None
-        };
+        let capacity = self.volume_at(&scan, self.focus).map(|v| (v.total, v.free));
         self.chart.view_root = self.view_root;
         let out = self.chart.show(
             &mut plot,
             &scan,
             self.focus,
             self.selected.or(self.list_hover),
-            volume.map(|v| (v.total, v.free)),
+            capacity,
             map.size(),
         );
         self.map_hover = out.hovered;
@@ -963,7 +941,7 @@ impl App {
                 status.push("Cached scan".to_string());
             }
             if scan.skipped > 0 {
-                status.push(format!("{} unreadable entries", scan.skipped));
+                status.push("Some entries unreadable".to_owned());
             }
             let msg = status.join("  ·  ");
             let region = Rect::from_min_max(pos2(split, rect.bottom() - 29.), rect.max);
@@ -1364,33 +1342,24 @@ impl App {
                 )
                 .clicked()
             {
-                let targets = self
-                    .collected
-                    .iter()
-                    .map(|i| i.target.clone())
-                    .collect::<Vec<_>>();
-                let (tx, rx) = mpsc::channel();
-                self.trash_job = Some(rx);
-                let memory = self.memory.clone();
-                self.dialog = None;
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let failed = if permanent {
-                        crate::cleanup::delete_permanently(&targets)
-                    } else {
-                        crate::cleanup::trash(&targets)
-                    };
-                    // Even a failed recursive deletion can have removed some descendants.
-                    let mut memory = memory.lock().unwrap();
-                    for target in &targets {
-                        memory.invalidate(&target.path);
-                    }
-                    let _ = tx.send(failed);
-                    ctx.request_repaint();
-                });
+                self.start_cleanup(ctx, permanent);
             }
         });
     }
+    fn start_cleanup(&mut self, ctx: &Context, permanent: bool) {
+        let targets: Vec<_> = self.collected.iter().map(|i| i.target.clone()).collect();
+        let (tx, rx) = mpsc::channel();
+        self.trash_job = Some(rx);
+        self.dialog = None;
+        let ctx = ctx.clone();
+        let cache = self.cache.client.clone();
+        let active = self.scan.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(cleanup(&targets, permanent, &cache, active));
+            ctx.request_repaint();
+        });
+    }
+
     fn details_dialog(&mut self, ui: &mut Ui, id: usize) {
         let scan = self.scan.as_ref().unwrap().clone();
         let node = &scan.nodes[id];
@@ -1466,16 +1435,6 @@ impl App {
             });
         if result.should_close() && self.dialog == Some(dialog) {
             self.dialog = None;
-        }
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        self.job.take();
-        // A completed scan is visible immediately. Finish publishing it on normal exit.
-        for writer in self.writers.drain(..) {
-            let _ = writer.join();
         }
     }
 }
@@ -1609,7 +1568,6 @@ fn volume_row(
     path: &Path,
     volume: Option<&Volume>,
     accent: Color32,
-    reusable: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 73.), Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1677,7 +1635,7 @@ fn volume_row(
         ui,
         button.center(),
         Align2::CENTER_CENTER,
-        if reusable { "Open" } else { "Scan" },
+        "Explore",
         14.,
         TEXT,
     );
@@ -1752,11 +1710,34 @@ mod tests {
         let a = dir.join("A");
         let child = a.join("child");
         let b = dir.join("B");
+        use std::os::unix::fs::PermissionsExt;
+        let mixed = a.join("partly removable");
+        let locked = mixed.join("locked");
         std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("keep"), "data").unwrap();
+        std::fs::write(mixed.join("remove"), "data").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::create_dir(&b).unwrap();
+        let toss = a.join("toss");
+        let changed = a.join("changed");
+        std::fs::write(&toss, "data").unwrap();
+        std::fs::write(&changed, "original").unwrap();
         let ctx = Context::default();
         let mut app = App::initialize(&ctx, Some(a.clone()));
         let first = finish_open(&mut app, &ctx);
+        for path in [&toss, &changed, &mixed] {
+            let id = first.nodes[0]
+                .children
+                .iter()
+                .find(|&&id| first.path(id) == *path)
+                .copied()
+                .unwrap();
+            app.collect(id);
+        }
+        assert_eq!(app.collected.len(), 3);
+        std::fs::rename(&changed, dir.join("moved")).unwrap();
+        std::fs::write(&changed, "replacement").unwrap();
         app.start(&ctx, b.clone());
         let other = finish_open(&mut app, &ctx);
         std::fs::write(child.join("new file"), "new data").unwrap();
@@ -1769,8 +1750,60 @@ mod tests {
         assert!(app.cached_view && Arc::ptr_eq(&opened, &first));
         assert_eq!(opened.path(app.view_root), child);
         assert!(opened.nodes[app.focus].children.is_empty());
-        app.up();
-        assert!(!app.explorer);
+        app.volumes.push(Volume {
+            name: "Child volume".into(),
+            path: child.clone(),
+            total: 900,
+            free: 250,
+            fs_type: "testfs".into(),
+        });
+        assert_eq!(app.volume_at(&opened, app.focus).unwrap().free, 250);
+
+        // Cancel before accepting the result, even if the worker finishes very quickly.
+        let epoch = crate::snapshots::generation();
+        app.rescan(&ctx);
+        app.job.take();
+        assert!(app.explorer && Arc::ptr_eq(app.scan.as_ref().unwrap(), &opened));
+        std::fs::rename(&child, a.join("away")).unwrap();
+        app.rescan(&ctx);
+        assert!(Arc::ptr_eq(&finish_open(&mut app, &ctx), &opened));
+        assert!(matches!(app.dialog, Some(Dialog::Error)));
+        std::fs::rename(a.join("away"), &child).unwrap();
+        assert_eq!(crate::snapshots::generation(), epoch);
+        app.dialog = None;
+        app.start(&ctx, child.clone());
+        assert!(Arc::ptr_eq(&finish_open(&mut app, &ctx), &first));
+
+        // Remove a sibling while inspecting the cached child. Keep the replaced
+        // item staged and reconcile any partial recursive removal using real IO.
+        app.start_cleanup(&ctx, true);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while app.trash_job.is_some() && Instant::now() < deadline {
+            app.poll(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.trash_job.is_none() && app.job.is_none() && app.explorer);
+        let repaired = app.scan.as_ref().unwrap();
+        assert_eq!(repaired.path(app.focus), child);
+        assert!(!repaired.nodes.iter().any(|n| n.name == "toss"));
+        assert!(repaired.nodes.iter().any(|n| n.name == "changed"));
+        assert!(!toss.exists());
+        assert_eq!(std::fs::read(&changed).unwrap(), b"replacement");
+        assert!(app.collected.iter().any(|i| i.target.path == changed));
+        assert!(!app.collected.iter().any(|i| i.target.path == toss));
+        if locked.exists() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mixed_id = cache::locate(repaired, &mixed).unwrap();
+            assert_eq!(repaired.nodes[mixed_id].children.len(), 1);
+            assert_eq!(
+                repaired.nodes[repaired.nodes[mixed_id].children[0]].name,
+                "locked"
+            );
+            assert!(app.collected.iter().any(|i| i.target.path == mixed));
+        }
+        // The sibling cleanup did not silently remeasure the stale child.
+        assert!(repaired.nodes[app.focus].children.is_empty());
+        app.dialog = None;
         app.rescan(&ctx);
         let updated = finish_open(&mut app, &ctx);
         assert!(!app.cached_view);
@@ -1781,14 +1814,17 @@ mod tests {
         assert!(Arc::ptr_eq(&finish_open(&mut app, &ctx), &other));
         drop(app);
 
-        let mut reopened = App::initialize(&ctx, Some(child));
+        let mut reopened = App::initialize(&ctx, Some(child.clone()));
         assert_eq!(finish_open(&mut reopened, &ctx).nodes[0].children.len(), 1);
         assert!(reopened.cached_view);
         reopened.start(&ctx, b);
         finish_open(&mut reopened, &ctx);
         assert!(reopened.cached_view);
         reopened.start(&ctx, a);
-        finish_open(&mut reopened, &ctx);
-        assert!(!reopened.cached_view);
+        let patched_parent = finish_open(&mut reopened, &ctx);
+        assert!(reopened.cached_view);
+        let child_id = cache::locate(&patched_parent, &child).unwrap();
+        assert_eq!(patched_parent.nodes[child_id].children.len(), 1);
+        assert!(!patched_parent.nodes.iter().any(|n| n.name == "toss"));
     }
 }

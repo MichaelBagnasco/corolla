@@ -2,15 +2,15 @@
 //! the original Unix path and filesystem identity are verified from each header.
 use crate::{
     cache::locate,
+    patch::{self, Changes},
     scan::{Node, Scan},
 };
 use flate2::{Compression, bufread::GzDecoder, write::GzEncoder};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    hash::{Hash, Hasher},
     io::{self, BufReader, BufWriter, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
@@ -21,7 +21,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAGIC: &[u8; 8] = b"COROLLA1";
+const OLD_MAGIC: &[u8; 8] = b"COROLLA1";
+const MAGIC: &[u8; 8] = b"COROLLA2";
+const CATALOG_MAGIC: &[u8; 8] = b"CORIDX02";
 const MIB: u64 = 1 << 20;
 const MAX_FILE: u64 = 192 * MIB;
 const MAX_DISK: u64 = 512 * MIB;
@@ -39,7 +41,7 @@ fn directory() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
-        .map(|p| p.join("corolla/scans"))
+        .map(|p| p.join("corolla/scans/v2"))
 }
 
 fn lock(dir: &Path, shared: bool) -> io::Result<File> {
@@ -69,28 +71,167 @@ fn integer<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     Ok(n)
 }
 
-fn read_epoch(dir: &Path) -> io::Result<u64> {
-    let mut file = OpenOptions::new()
+/// Legacy catalogs contain just the epoch and its complement. New catalogs
+/// identify every readable snapshot by filename and the revision in its header.
+#[derive(Clone)]
+struct Catalog {
+    epoch: u64,
+    revisions: Option<HashMap<String, u64>>,
+}
+
+impl Catalog {
+    fn permits(&self, filename: &str, revision: u64) -> bool {
+        match &self.revisions {
+            Some(revisions) => revisions.get(filename) == Some(&revision),
+            None => revision == 0,
+        }
+    }
+
+    fn publish(dir: &Path, epoch: u64, entries: &[Header]) -> io::Result<Self> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(CATALOG_MAGIC);
+        payload.extend_from_slice(&epoch.to_le_bytes());
+        payload.extend_from_slice(&(!epoch).to_le_bytes());
+        payload.push(entries.len().try_into().map_err(|_| invalid())?);
+        let mut revisions = HashMap::new();
+        for entry in entries {
+            let name = entry.filename().ok_or_else(invalid)?;
+            payload.push(name.len().try_into().map_err(|_| invalid())?);
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&entry.revision.to_le_bytes());
+            revisions.insert(name.to_owned(), entry.revision);
+        }
+        let mut crc = flate2::Crc::new();
+        crc.update(&payload);
+        payload.extend_from_slice(&crc.sum().to_le_bytes());
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(&payload)?;
+        temp.as_file().sync_all()?;
+        temp.persist(dir.join("epoch"))?;
+        File::open(dir)?.sync_all()?;
+        Ok(Self {
+            epoch,
+            revisions: Some(revisions),
+        })
+    }
+}
+
+fn read_catalog(dir: &Path) -> io::Result<Catalog> {
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join("epoch"))?;
-    if file.metadata()?.len() != 16 {
+    if !file.metadata()?.is_file() {
         return Err(invalid());
     }
-    let epoch = u64::from_le_bytes(integer(&mut file)?);
-    if u64::from_le_bytes(integer(&mut file)?) != !epoch {
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() == 16 {
+        let mut input = &bytes[..];
+        let epoch = u64::from_le_bytes(integer(&mut input)?);
+        if u64::from_le_bytes(integer(&mut input)?) != !epoch {
+            return Err(invalid());
+        }
+        return Ok(Catalog {
+            epoch,
+            revisions: None,
+        });
+    }
+    if !(29..=4096).contains(&bytes.len()) {
         return Err(invalid());
     }
-    Ok(epoch)
+    let (mut payload, checksum) = bytes.split_at(bytes.len() - 4);
+    let mut crc = flate2::Crc::new();
+    crc.update(payload);
+    if checksum != crc.sum().to_le_bytes() || &integer::<8>(&mut payload)? != CATALOG_MAGIC {
+        return Err(invalid());
+    }
+    let epoch = u64::from_le_bytes(integer(&mut payload)?);
+    if u64::from_le_bytes(integer(&mut payload)?) != !epoch {
+        return Err(invalid());
+    }
+    let [count] = integer(&mut payload)?;
+    if usize::from(count) > MAX_FILES {
+        return Err(invalid());
+    }
+    let mut revisions = HashMap::new();
+    for _ in 0..count {
+        let [len] = integer(&mut payload)?;
+        let mut name = vec![0; usize::from(len)];
+        payload.read_exact(&mut name)?;
+        let name = String::from_utf8(name).map_err(|_| invalid())?;
+        if !name.ends_with(".csn")
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b's' || b == b'n')
+        {
+            return Err(invalid());
+        }
+        let revision = u64::from_le_bytes(integer(&mut payload)?);
+        if revisions.insert(name, revision).is_some() {
+            return Err(invalid());
+        }
+    }
+    if !payload.is_empty() {
+        return Err(invalid());
+    }
+    Ok(Catalog {
+        epoch,
+        revisions: Some(revisions),
+    })
 }
 
-fn write_epoch(dir: &Path, epoch: u64) -> io::Result<()> {
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.write_all(&epoch.to_le_bytes())?;
-    temp.write_all(&(!epoch).to_le_bytes())?;
-    temp.as_file().sync_all()?;
-    temp.persist(dir.join("epoch"))?;
-    Ok(())
+// Keep the old format's directory and epoch untouched: a running 0.1.1
+// process treats a new-format epoch as corruption and removes its own maps.
+fn import_legacy(dir: &Path) -> io::Result<Vec<Header>> {
+    let Some(old_dir) = dir
+        .parent()
+        .filter(|_| dir.file_name() == Some(OsStr::new("v2")))
+    else {
+        return Ok(Vec::new());
+    };
+    if !old_dir.join("epoch").is_file() {
+        return Ok(Vec::new());
+    }
+    let _old_lock = lock(old_dir, true)?;
+    let Ok(legacy) = read_catalog(old_dir) else {
+        return Ok(Vec::new());
+    };
+    if legacy.revisions.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut candidates: Vec<_> = headers(old_dir, &legacy)?
+        .into_iter()
+        .filter(matches_root)
+        .collect();
+    trim(&mut candidates);
+    let mut imported = Vec::new();
+    for mut h in candidates {
+        let output = dir.join(filename(&h.root));
+        if fs::hard_link(&h.path, &output).is_ok() {
+            h.path = output;
+            imported.push(h);
+        }
+    }
+    Ok(imported)
+}
+
+fn record_migration(dir: &Path) -> io::Result<()> {
+    // Once any new-format catalog is in use, absence or corruption of that
+    // catalog should start empty rather than resurrecting pre-cleanup maps.
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("initialized"))
+    {
+        Ok(marker) => {
+            marker.sync_all()?;
+            File::open(dir)?.sync_all()
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn generation_at(dir: &Path) -> io::Result<u64> {
@@ -109,8 +250,11 @@ fn generation_at(dir: &Path) -> io::Result<u64> {
             let _ = fs::remove_file(entry.path());
         }
     }
-    match read_epoch(dir) {
-        Ok(value) => Ok(value),
+    match read_catalog(dir) {
+        Ok(catalog) => {
+            record_migration(dir)?;
+            Ok(catalog.epoch)
+        }
         Err(e)
             if matches!(
                 e.kind(),
@@ -129,7 +273,14 @@ fn generation_at(dir: &Path) -> io::Result<u64> {
                 .duration_since(UNIX_EPOCH)
                 .map_err(io::Error::other)?
                 .as_nanos() as u64;
-            write_epoch(dir, value)?;
+            let imported =
+                if e.kind() == io::ErrorKind::NotFound && !dir.join("initialized").try_exists()? {
+                    import_legacy(dir)?
+                } else {
+                    Vec::new()
+                };
+            Catalog::publish(dir, value, &imported)?;
+            record_migration(dir)?;
             Ok(value)
         }
         Err(e) => Err(e),
@@ -140,10 +291,15 @@ pub fn generation() -> Option<u64> {
     generation_at(&directory()?).ok()
 }
 
-fn read_path(r: &mut impl Read) -> io::Result<PathBuf> {
-    if &integer::<8>(r)? != MAGIC {
+fn read_path(r: &mut impl Read) -> io::Result<(PathBuf, u64)> {
+    let magic = integer::<8>(r)?;
+    let revision = if &magic == OLD_MAGIC {
+        0
+    } else if &magic == MAGIC {
+        u64::from_le_bytes(integer(r)?)
+    } else {
         return Err(invalid());
-    }
+    };
     let len = u32::from_le_bytes(integer(r)?) as usize;
     if len == 0 || len > 4096 {
         return Err(invalid());
@@ -157,10 +313,12 @@ fn read_path(r: &mut impl Read) -> io::Result<PathBuf> {
     if !path.is_absolute() || path.components().any(|x| matches!(x, Component::ParentDir)) {
         return Err(invalid());
     }
-    Ok(path)
+    Ok((path, revision))
 }
 
+#[derive(Clone)]
 struct Header {
+    revision: u64,
     path: PathBuf,
     root: PathBuf,
     identity: (u64, u64),
@@ -168,7 +326,13 @@ struct Header {
     bytes: u64,
 }
 
-fn headers(dir: &Path) -> io::Result<Vec<Header>> {
+impl Header {
+    fn filename(&self) -> Option<&str> {
+        self.path.file_name()?.to_str()
+    }
+}
+
+fn headers(dir: &Path, catalog: &Catalog) -> io::Result<Vec<Header>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -186,12 +350,20 @@ fn headers(dir: &Path) -> io::Result<Vec<Header>> {
                 return Err(invalid());
             }
             let mut reader = BufReader::new(file);
-            let root = read_path(&mut reader)?;
+            let (root, revision) = read_path(&mut reader)?;
+            if !path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|n| catalog.permits(n, revision))
+            {
+                return Err(invalid());
+            }
             let identity = (
                 u64::from_le_bytes(integer(&mut reader)?),
                 u64::from_le_bytes(integer(&mut reader)?),
             );
             Ok(Header {
+                revision,
                 path,
                 root,
                 identity,
@@ -212,22 +384,7 @@ fn matches_root(header: &Header) -> bool {
         .is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == header.identity)
 }
 
-pub fn roots() -> Vec<PathBuf> {
-    let Some(dir) = directory() else {
-        return Vec::new();
-    };
-    let Ok(_lock) = lock(&dir, true) else {
-        return Vec::new();
-    };
-    headers(&dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(matches_root)
-        .map(|h| h.root)
-        .collect()
-}
-
-fn write_data(scan: &Scan, file: &mut File) -> io::Result<()> {
+fn write_data(scan: &Scan, file: &mut File, revision: u64) -> io::Result<()> {
     let path = scan.root.as_os_str().as_bytes();
     if path.len() > 4096 || scan.nodes.is_empty() || scan.nodes.len() > MAX_NODES {
         return Err(invalid());
@@ -235,6 +392,7 @@ fn write_data(scan: &Scan, file: &mut File) -> io::Result<()> {
     let root = &scan.nodes[0];
     let mut writer = BufWriter::new(file);
     writer.write_all(MAGIC)?;
+    writer.write_all(&revision.to_le_bytes())?;
     writer.write_all(&(path.len() as u32).to_le_bytes())?;
     writer.write_all(path)?;
     writer.write_all(&root.identity.0.to_le_bytes())?;
@@ -267,7 +425,8 @@ fn write_data(scan: &Scan, file: &mut File) -> io::Result<()> {
 
 fn decode(header: &Header) -> io::Result<Scan> {
     let mut file = BufReader::new(File::open(&header.path)?);
-    if read_path(&mut file)? != header.root {
+    let (root, revision) = read_path(&mut file)?;
+    if root != header.root || revision != header.revision {
         return Err(invalid());
     }
     let identity = (
@@ -369,87 +528,137 @@ fn decode(header: &Header) -> io::Result<Scan> {
     })
 }
 
+fn find_in(scan: &Scan, path: &Path) -> Option<usize> {
+    let id = locate(scan, path)?;
+    let meta = fs::metadata(path).ok()?;
+    let (dev, ino, _, _) = scan.nodes[id].identity;
+    (meta.is_dir() && (dev, ino) == (meta.dev(), meta.ino())).then_some(id)
+}
+
 fn load_at(dir: &Path, requested: &Path) -> Option<(Arc<Scan>, usize)> {
     let canonical = requested.canonicalize().ok()?;
-    let metadata = fs::metadata(&canonical).ok()?;
-    if !metadata.is_dir() {
-        return None;
-    }
     let _lock = lock(dir, true).ok()?;
-    read_epoch(dir).ok()?;
-    for h in headers(dir).ok()? {
-        if !crate::scan::can_cover(&h.root, &canonical) || !matches_root(&h) {
-            continue;
-        }
-        if let Ok(scan) = decode(&h)
-            && let Some(id) = locate(&scan, &canonical)
+    for h in headers(dir, &read_catalog(dir).ok()?).ok()? {
+        if crate::scan::can_cover(&h.root, &canonical)
+            && matches_root(&h)
+            && let Ok(scan) = decode(&h)
+            && let Some(id) = find_in(&scan, &canonical)
         {
-            let (dev, ino, _, _) = scan.nodes[id].identity;
-            if (dev, ino) == (metadata.dev(), metadata.ino()) && scan.nodes[id].is_dir {
-                return Some((Arc::new(scan), id));
-            }
+            return Some((Arc::new(scan), id));
         }
     }
     None
 }
 
 pub fn load(path: &Path) -> Option<(Arc<Scan>, usize)> {
-    load_at(&directory()?, path)
+    let dir = directory()?;
+    if !dir.join("epoch").is_file() {
+        generation_at(&dir).ok()?;
+    }
+    load_at(&dir, path)
 }
 
 fn filename(root: &Path) -> String {
-    let mut hash = DefaultHasher::new();
-    root.as_os_str().as_bytes().hash(&mut hash);
-    format!("{:016x}.csn", hash.finish())
+    // FNV-1a over the unmodified Unix path, stable across Rust toolchains.
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+        });
+    format!("{hash:016x}.csn")
 }
 
-fn save_at(dir: &Path, scan: &Scan, epoch: u64) -> io::Result<()> {
-    let mut temp = {
-        let _lock = lock(dir, true)?;
-        if read_epoch(dir)? != epoch {
-            return Ok(());
+fn trim(entries: &mut Vec<Header>) {
+    let mut bytes = 0;
+    let mut roots = HashSet::new();
+    let mut names = HashSet::new();
+    entries.retain(|h| {
+        if roots.len() == MAX_FILES
+            || bytes + h.bytes > MAX_DISK
+            || roots.contains(&h.root)
+            || names.contains(&h.path)
+        {
+            return false;
         }
-        let temp = tempfile::Builder::new()
-            .prefix(".snapshot-")
-            .tempfile_in(dir)?;
-        temp.as_file().lock()?;
-        temp
-    };
-    write_data(scan, temp.as_file_mut())?;
-    let bytes = temp.as_file().metadata()?.len();
-    if bytes > MAX_FILE {
-        return Err(invalid());
-    }
-    temp.as_file().sync_all()?;
-    let _lock = lock(dir, false)?;
-    if read_epoch(dir)? != epoch {
+        bytes += h.bytes;
+        roots.insert(h.root.clone());
+        names.insert(h.path.clone());
+        true
+    });
+}
+
+fn reap(dir: &Path, catalog: &Catalog) -> io::Result<()> {
+    let Some(revisions) = &catalog.revisions else {
         return Ok(());
-    }
-    let destination = dir.join(filename(&scan.root));
-    let mut total = bytes;
-    let mut count = 1;
-    // Keep recent usable snapshots within count and byte quotas. Clean up damaged
-    // snapshots, too, so an interrupted or obsolete cache never consumes the quota.
-    let mut keep = std::collections::HashSet::new();
-    keep.insert(destination.clone());
-    for h in headers(dir)? {
-        if h.path == destination {
-            continue;
-        }
-        if count < MAX_FILES && total + h.bytes <= MAX_DISK {
-            total += h.bytes;
-            count += 1;
-            keep.insert(h.path);
-        }
-    }
+    };
     for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension() == Some(OsStr::new("csn")) && !keep.contains(&path) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() == Some(OsStr::new("csn"))
+            && !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| revisions.contains_key(s))
+        {
             fs::remove_file(path)?;
         }
     }
-    temp.persist(destination)?;
     Ok(())
+}
+
+fn stage(dir: &Path, scan: &Scan, epoch: u64) -> io::Result<tempfile::NamedTempFile> {
+    let mut temp = tempfile::Builder::new()
+        .prefix(".snapshot-")
+        .tempfile_in(dir)?;
+    temp.as_file().lock()?;
+    write_data(scan, temp.as_file_mut(), epoch)?;
+    if temp.as_file().metadata()?.len() > MAX_FILE {
+        return Err(invalid());
+    }
+    temp.as_file().sync_all()?;
+    Ok(temp)
+}
+
+fn persist(
+    dir: &Path,
+    scan: &Scan,
+    epoch: u64,
+    temp: tempfile::NamedTempFile,
+) -> io::Result<Header> {
+    let path = dir.join(filename(&scan.root));
+    let file = temp.persist(&path)?;
+    let meta = file.metadata()?;
+    let (dev, ino, _, _) = scan.nodes[0].identity;
+    Ok(Header {
+        root: scan.root.clone(),
+        path,
+        identity: (dev, ino),
+        revision: epoch,
+        bytes: meta.len(),
+        modified: meta.modified()?,
+    })
+}
+
+fn save_at(dir: &Path, scan: &Scan, expected: u64) -> io::Result<()> {
+    let temp = {
+        let _lock = lock(dir, true)?;
+        if read_catalog(dir)?.epoch != expected {
+            return Ok(());
+        }
+        stage(dir, scan, expected)?
+    };
+    let _lock = lock(dir, false)?;
+    let current = read_catalog(dir)?;
+    if current.epoch != expected {
+        return Ok(());
+    }
+    let mut entries = headers(dir, &current)?;
+    entries.insert(0, persist(dir, scan, expected, temp)?);
+    trim(&mut entries);
+    let published = Catalog::publish(dir, expected, &entries)?;
+    reap(dir, &published)
 }
 
 pub fn save_if_current(scan: &Scan, generation: Option<u64>) {
@@ -458,28 +667,74 @@ pub fn save_if_current(scan: &Scan, generation: Option<u64>) {
     }
 }
 
-fn invalidate_at(dir: &Path, path: &Path) -> io::Result<(u64, u64)> {
+fn update_at(
+    dir: &Path,
+    changes: &Changes,
+    expected: Option<u64>,
+) -> io::Result<Option<(u64, u64)>> {
     let _lock = lock(dir, false)?;
-    let before = read_epoch(dir)?;
+    let current = read_catalog(dir)?;
+    if expected.is_some_and(|epoch| epoch != current.epoch) {
+        return Ok(None);
+    }
+    let before = current.epoch;
     let after = before.checked_add(1).ok_or_else(invalid)?;
-    write_epoch(dir, after)?;
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    for h in headers(dir)? {
-        if path.starts_with(&h.root)
-            || h.root.starts_with(path)
-            || canonical.starts_with(&h.root)
-            || h.root.starts_with(&canonical)
+    let (affected, mut keep): (Vec<_>, Vec<_>) = headers(dir, &current)?
+        .into_iter()
+        .partition(|header| changes.affects(&header.root));
+    trim(&mut keep);
+    // Commit the invalidation first. A crash at any point after this rename
+    // leaves touched files unreadable, including files only partially replaced.
+    // Unrelated scans remain readable at their previous individual revisions.
+    Catalog::publish(dir, after, &keep)?;
+    let mut replacements = Vec::new();
+    for header in affected {
+        if changes
+            .refreshed
+            .as_ref()
+            .is_some_and(|s| s.root == header.root)
+            || !matches_root(&header)
         {
-            fs::remove_file(h.path)?;
+            continue;
+        }
+        let Ok(previous) = decode(&header) else {
+            continue;
+        };
+        if !changes.touches(&previous) {
+            keep.push(header);
+            continue;
+        }
+        if let Some(patched) = patch::apply(&previous, changes)
+            && let Ok(temp) = stage(dir, &patched, after)
+        {
+            replacements.push(persist(dir, &patched, after, temp)?);
         }
     }
-    Ok((before, after))
+    if let Some(fresh) = &changes.refreshed {
+        let cleaned;
+        let snapshot = if changes.removed.is_empty() {
+            Some(fresh.as_ref())
+        } else {
+            cleaned = patch::apply(fresh, changes);
+            cleaned.as_ref()
+        };
+        if let Some(scan) = snapshot
+            && let Ok(temp) = stage(dir, scan, after)
+        {
+            replacements.insert(0, persist(dir, scan, after, temp)?);
+        }
+    }
+    replacements.append(&mut keep);
+    trim(&mut replacements);
+    let published = Catalog::publish(dir, after, &replacements)?;
+    reap(dir, &published)?;
+    Ok(Some((before, after)))
 }
 
-pub fn invalidate(path: &Path) -> Option<(u64, u64)> {
+pub fn update(changes: &Changes, expected: Option<u64>) -> Option<(u64, u64)> {
     let dir = directory()?;
     generation_at(&dir).ok()?;
-    invalidate_at(&dir, path).ok()
+    update_at(&dir, changes, expected).ok()?
 }
 
 #[cfg(test)]
@@ -519,12 +774,14 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_removes_overlaps_keeps_siblings_and_blocks_late_writes() {
+    fn cleanup_patches_parent_and_keeps_unrelated_roots_in_one_generation() {
         let files = tempfile::tempdir().unwrap();
         let a = files.path().join("a");
         let b = files.path().join("b");
-        fs::create_dir(&a).unwrap();
-        fs::create_dir(&b).unwrap();
+        let c = files.path().join("c");
+        for p in [&a, &b, &c] {
+            fs::create_dir(p).unwrap();
+        }
         let old = scan(files.path());
         let cache = tempfile::tempdir().unwrap();
         let dir = cache.path();
@@ -532,13 +789,136 @@ mod tests {
         for tree in [&old, &scan(&a), &scan(&b)] {
             save_at(dir, tree, before).unwrap();
         }
-        let (previous, next) = invalidate_at(dir, &a).unwrap();
-        assert_eq!(previous, before);
-        assert_eq!(next, generation_at(dir).unwrap());
+        fs::remove_dir(&a).unwrap();
+        fs::remove_dir(&c).unwrap();
+        let changes = Changes {
+            removed: vec![a.clone(), c],
+            ..Default::default()
+        };
+        let pair = update_at(dir, &changes, None).unwrap().unwrap();
+        assert_eq!(pair, (before, before + 1));
         save_at(dir, &old, before).unwrap();
-        assert!(load_at(dir, &a).is_none());
-        assert!(load_at(dir, files.path()).is_none());
+        let (updated, _) = load_at(dir, files.path()).unwrap();
+        assert_eq!(updated.nodes[0].children.len(), 1);
+        assert_eq!(updated.path(updated.nodes[0].children[0]), b);
+        assert_eq!(updated.nodes[0].bytes, scan(files.path()).nodes[0].bytes);
         assert!(load_at(dir, &b).is_some());
+        assert_eq!(
+            read_catalog(dir)
+                .unwrap()
+                .revisions
+                .unwrap()
+                .get(&filename(&b)),
+            Some(&before)
+        );
+    }
+
+    #[test]
+    fn refresh_persists_both_ancestor_and_subtree_and_rejects_stale_writers() {
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path();
+        let branch = root.join("branch");
+        fs::create_dir(&branch).unwrap();
+        fs::write(branch.join("old"), "old").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path();
+        let before = generation_at(dir).unwrap();
+        save_at(dir, &scan(root), before).unwrap();
+        let old = fs::read(dir.join(filename(root))).unwrap();
+        fs::rename(branch.join("old"), branch.join("new")).unwrap();
+        let changes = Changes {
+            refreshed: Some(Arc::new(scan(&branch))),
+            ..Default::default()
+        };
+        assert_eq!(
+            update_at(dir, &changes, Some(before)).unwrap(),
+            Some((before, before + 1))
+        );
+        assert!(update_at(dir, &changes, Some(before)).unwrap().is_none());
+        for path in [root, branch.as_path()] {
+            let (updated, _) = load_at(dir, path).unwrap();
+            assert!(updated.nodes.iter().any(|n| n.name == "new"));
+            assert!(!updated.nodes.iter().any(|n| n.name == "old"));
+        }
+        assert_eq!(headers(dir, &read_catalog(dir).unwrap()).unwrap().len(), 2);
+        // Even restoring an otherwise intact old gzip must not revive its revision.
+        fs::write(dir.join(filename(root)), old).unwrap();
+        assert!(load_at(dir, root).is_none());
+    }
+
+    #[test]
+    fn failed_batch_exposes_only_untouched_snapshots_after_restart() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("parent");
+        let branch = root.join("branch");
+        let other = base.path().join("other");
+        fs::create_dir_all(&branch).unwrap();
+        fs::create_dir(&other).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path();
+        let epoch = generation_at(dir).unwrap();
+        for s in [scan(&root), scan(&other)] {
+            save_at(dir, &s, epoch).unwrap();
+        }
+        fs::write(branch.join("new"), "new").unwrap();
+        // Fail the last rename, after the patched parent has reached disk.
+        fs::create_dir(dir.join(filename(&branch))).unwrap();
+        let changes = Changes {
+            refreshed: Some(Arc::new(scan(&branch))),
+            ..Default::default()
+        };
+        assert!(update_at(dir, &changes, Some(epoch)).is_err());
+        assert_eq!(generation_at(dir).unwrap(), epoch + 1);
+        assert!(load_at(dir, &root).is_none());
+        assert!(load_at(dir, &branch).is_none());
+        assert!(load_at(dir, &other).is_some());
+        save_at(dir, &scan(&root), epoch).unwrap();
+        assert!(load_at(dir, &root).is_none());
+    }
+
+    #[test]
+    fn legacy_snapshots_open_then_migrate_without_duplicate_files() {
+        let files = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path();
+        let epoch = 12345u64;
+        let tree = scan(files.path());
+        fs::write(
+            dir.join("epoch"),
+            [epoch.to_le_bytes(), (!epoch).to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let mut buf = tempfile::tempfile().unwrap();
+        write_data(&tree, &mut buf, epoch).unwrap();
+        use std::io::{Seek, SeekFrom};
+        buf.seek(SeekFrom::Start(16)).unwrap();
+        let mut body = OLD_MAGIC.to_vec();
+        buf.read_to_end(&mut body).unwrap();
+        let legacy = dir.join("abababababababab.csn");
+        fs::write(&legacy, body).unwrap();
+        let new = dir.join("v2");
+        let next = generation_at(&new).unwrap();
+        let (restored, _) = load_at(&new, files.path()).unwrap();
+        assert_eq!(restored.nodes[0].identity, tree.nodes[0].identity);
+        assert!(load_at(dir, files.path()).is_some());
+        // Old readers can still open their original file after the upgrade.
+        assert_eq!(fs::metadata(dir.join("epoch")).unwrap().len(), 16);
+        assert_eq!(
+            fs::metadata(&legacy).unwrap().ino(),
+            fs::metadata(new.join(filename(files.path())))
+                .unwrap()
+                .ino()
+        );
+        save_at(&new, &tree, next).unwrap();
+        assert!(legacy.exists());
+        assert_eq!(
+            headers(&new, &read_catalog(&new).unwrap()).unwrap().len(),
+            1
+        );
+        fs::remove_file(new.join("epoch")).unwrap();
+        generation_at(&new).unwrap();
+        assert!(load_at(&new, files.path()).is_none());
+        assert!(load_at(dir, files.path()).is_some());
     }
 
     #[test]
@@ -573,7 +953,10 @@ mod tests {
             fs::create_dir(&last).unwrap();
             save_at(dir, &scan(&last), epoch).unwrap();
         }
-        assert_eq!(headers(dir).unwrap().len(), MAX_FILES);
+        assert_eq!(
+            headers(dir, &read_catalog(dir).unwrap()).unwrap().len(),
+            MAX_FILES
+        );
         fs::rename(&last, files.path().join("old")).unwrap();
         fs::create_dir(&last).unwrap();
         assert!(load_at(dir, &last).is_none());

@@ -3,6 +3,7 @@ mod cache;
 mod chart;
 mod cleanup;
 mod favorites;
+mod patch;
 mod preview;
 mod scan;
 mod snapshots;

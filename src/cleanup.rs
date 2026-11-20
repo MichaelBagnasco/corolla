@@ -11,6 +11,7 @@ use std::{
 pub struct Target {
     pub path: PathBuf,
     identity: (u64, u64, i64, i64),
+    is_dir: bool,
 }
 
 impl Target {
@@ -31,6 +32,7 @@ impl Target {
         Ok(Self {
             path: path.into(),
             identity: (m.dev(), m.ino(), m.ctime(), m.ctime_nsec()),
+            is_dir: m.is_dir(),
         })
     }
 
@@ -50,53 +52,76 @@ impl Target {
     }
 }
 
-fn apply(
-    targets: &[Target],
-    mut action: impl FnMut(&Path) -> Result<(), String>,
-) -> Vec<(PathBuf, String)> {
-    targets
-        .iter()
-        .filter_map(|item| {
-            item.verify()
-                .and_then(|_| action(&item.path))
-                .err()
-                .map(|e| (item.path.clone(), e))
-        })
-        .collect()
+#[derive(Default)]
+pub struct CleanupReport {
+    pub failed: Vec<(PathBuf, String)>,
+    /// A recursive removal may have removed children before reporting failure.
+    pub recheck: Vec<PathBuf>,
 }
 
-fn run(command: &mut Command) -> Result<(), String> {
-    let output = command.output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
-}
-
-pub fn trash(targets: &[Target]) -> Vec<(PathBuf, String)> {
-    apply(targets, |path| {
-        run(Command::new("gio").args(["trash", "--"]).arg(path))
-    })
-}
-
-pub fn delete_permanently(targets: &[Target]) -> Vec<(PathBuf, String)> {
-    apply(targets, |path| {
-        run(Command::new("rm")
-            .args([
+pub fn remove(targets: &[Target], permanent: bool) -> CleanupReport {
+    let mut report = CleanupReport::default();
+    for target in targets {
+        if let Err(error) = target.verify() {
+            report.failed.push((target.path.clone(), error));
+            continue;
+        }
+        let mut command = if permanent {
+            let mut rm = Command::new("rm");
+            rm.args([
                 "--recursive",
                 "--one-file-system",
                 "--preserve-root=all",
                 "--interactive=never",
                 "--",
-            ])
-            .arg(path))
-    })
+            ]);
+            rm
+        } else {
+            let mut gio = Command::new("gio");
+            gio.args(["trash", "--"]);
+            gio
+        };
+        let error = match command.arg(&target.path).output() {
+            Ok(output) if output.status.success() => continue,
+            Ok(output) => {
+                if permanent && target.is_dir {
+                    report.recheck.push(target.path.clone());
+                }
+                String::from_utf8_lossy(&output.stderr).trim().to_owned()
+            }
+            Err(error) => error.to_string(),
+        };
+        report.failed.push((target.path.clone(), error));
+    }
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_recursive_removal_marks_only_the_attempted_directory_for_recheck() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("tree");
+        let protected = dir.join("protected");
+        fs::create_dir_all(&protected).unwrap();
+        fs::write(protected.join("keep"), "data").unwrap();
+        fs::write(dir.join("removable"), "data").unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+        let target = Target::capture(&dir).unwrap();
+        let report = remove(&[target], true);
+        if !protected.exists() {
+            // Privileged test runners can remove the entire fixture.
+            assert!(report.failed.is_empty() && report.recheck.is_empty());
+            return;
+        }
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(report.recheck, vec![dir.clone()]);
+        assert_eq!(report.failed[0].0, dir);
+        assert!(!dir.join("removable").exists());
+    }
 
     #[test]
     fn changed_entries_are_retained_and_symlinks_are_unlinked() {
@@ -108,11 +133,17 @@ mod tests {
         fs::rename(&file, dir.join("moved")).unwrap();
         fs::write(&file, "replacement").unwrap();
         assert!(Target::from_scan(&file, old.identity).is_err());
-        assert_eq!(delete_permanently(&[old]).len(), 1);
+        let report = remove(&[old], true);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.recheck.is_empty());
         assert_eq!(fs::read(&file).unwrap(), b"replacement");
         let link = dir.join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert!(delete_permanently(&[Target::capture(&link).unwrap()]).is_empty());
+        assert!(
+            remove(&[Target::capture(&link).unwrap()], true)
+                .failed
+                .is_empty()
+        );
         assert!(file.exists());
         assert!(!link.exists());
         fs::remove_dir_all(dir).unwrap();

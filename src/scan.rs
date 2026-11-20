@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub name: OsString,
     pub bytes: u64,
@@ -22,7 +22,7 @@ pub struct Node {
     pub parent: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scan {
     pub root: PathBuf,
     pub nodes: Vec<Node>,
