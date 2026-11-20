@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Corolla
+GenericName=Disk Usage Analyzer
+Comment=Explore disk usage in an interactive radial map
+Exec=corolla %f
+Icon=corolla
+Terminal=false
+Categories=System;Filesystem;
+Keywords=storage;space;disk;folders;usage;
+StartupWMClass=corolla

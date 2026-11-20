@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if ! command -v cargo >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+    source "$HOME/.cargo/env"
+fi
+project="$PWD"
+builddir="$(mktemp -d)"
+trap 'rm -rf "$builddir"' EXIT
+version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
+tar czf "$builddir/corolla-$version.tar.gz" --transform="s,^,corolla-$version/," Cargo.{toml,lock} src assets packaging/corolla.{desktop,svg}
+cp packaging/PKGBUILD "$builddir/"
+cd "$builddir"
+export PKGDEST="$project/packaging"
+export CARGO_TARGET_DIR="$project/target"
+# The user-local Rust toolchain also provides cargo outside pacman's database.
+makepkg --nodeps --force

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if ! command -v cargo >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+    source "$HOME/.cargo/env"
+fi
+cargo build --locked --release
+prefix="${PREFIX:-$HOME/.local}"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+install -Dm755 target/release/corolla "$prefix/bin/corolla"
+install -Dm644 packaging/corolla.svg "$data/icons/hicolor/scalable/apps/corolla.svg"
+desktop="$data/applications/corolla.desktop"
+install -Dm644 packaging/corolla.desktop "$desktop"
+desktop-file-edit --set-key=Exec --set-value="\"$prefix/bin/corolla\" %f" "$desktop"
+update-desktop-database "$data/applications"
